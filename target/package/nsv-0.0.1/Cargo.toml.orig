@@ -1,0 +1,13 @@
+[package]
+name = "nsv"
+version = "0.0.1"
+edition = "2021"
+description = "NSV (Newline-Separated Values) format parser - Rust implementation coming soon"
+license = "MIT"
+repository = "https://github.com/nsv-format/rust"
+homepage = "https://nsv-format.org"
+keywords = ["nsv", "csv", "data", "format", "parser"]
+categories = ["parsing", "data-structures"]
+authors = ["naming"]
+
+[dependencies]

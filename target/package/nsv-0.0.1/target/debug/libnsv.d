@@ -1,0 +1,1 @@
+/Users/nati/sandbox/naming/nsv-python/nsv-npm-claim/nsv-rust-claim/target/package/nsv-0.0.1/target/debug/libnsv.rlib: /Users/nati/sandbox/naming/nsv-python/nsv-npm-claim/nsv-rust-claim/target/package/nsv-0.0.1/src/lib.rs
