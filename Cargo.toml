@@ -1,8 +1,8 @@
 [package]
 name = "nsv"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
-description = "NSV (Newline-Separated Values) format parser - Rust implementation coming soon"
+description = "NSV (Newline-Separated Values) format parser and encoder"
 license = "MIT"
 repository = "https://github.com/nsv-format/nsv-rust"
 homepage = "https://nsv-format.org"
