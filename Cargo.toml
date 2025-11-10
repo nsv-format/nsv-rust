@@ -16,7 +16,12 @@ memchr = "2.7"
 
 [dev-dependencies]
 criterion = "0.5"
+csv = "1.3"
 
 [[bench]]
 name = "parse"
+harness = false
+
+[[bench]]
+name = "comparison"
 harness = false
