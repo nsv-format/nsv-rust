@@ -6,13 +6,14 @@
 //! ## Parallel Parsing Strategy
 //!
 //! For files larger than 64KB, we use a parallel approach:
-//! 1. Find all row boundaries (positions of `\n\n`) using memchr
+//! 1. Find all row boundaries (positions of `\n\n`) using memchr's SIMD-optimized search
 //! 2. Split the input into row slices
 //! 3. Parse each row in parallel using rayon
 //! 4. Each row is split on `\n` and cells are unescaped
 //!
 //! For smaller files, we use a sequential fast path to avoid thread overhead.
 
+use memchr::memmem;
 use rayon::prelude::*;
 
 /// Threshold for using parallel parsing (64KB)
@@ -66,15 +67,17 @@ fn loads_sequential(s: &str) -> Vec<Vec<String>> {
 
 /// Parallel implementation for large files
 fn loads_parallel(s: &str) -> Vec<Vec<String>> {
-    // Find all positions where "\n\n" occurs (including overlapping matches)
-    // We need overlapping matches to handle empty rows correctly (e.g., "\n\n\n" has two boundaries)
+    // Optimize for the common case: no empty rows
+    // Use fast non-overlapping memchr SIMD scan, then detect empty rows during parse
     let bytes = s.as_bytes();
+    let finder = memmem::Finder::new(b"\n\n");
     let mut boundaries = Vec::new();
+    let mut pos = 0;
 
-    for i in 0..bytes.len().saturating_sub(1) {
-        if bytes[i] == b'\n' && bytes[i + 1] == b'\n' {
-            boundaries.push(i);
-        }
+    // Fast non-overlapping scan
+    while let Some(offset) = finder.find(&bytes[pos..]) {
+        boundaries.push(pos + offset);
+        pos += offset + 2; // Skip past \n\n (non-overlapping)
     }
 
     // Edge case: if no double newlines found, treat as single row
@@ -92,31 +95,52 @@ fn loads_parallel(s: &str) -> Vec<Vec<String>> {
     let mut start = 0;
 
     for &boundary in &boundaries {
-        // Check if this boundary is valid given current start position
-        if boundary >= start {
-            // Normal case: slice from start to boundary
-            row_slices.push(&s[start..boundary]);
-        } else {
-            // Overlapping boundary case (empty row)
-            // This happens when we have "\n\n\n" - two overlapping "\n\n" patterns
-            row_slices.push("");
-        }
-        // Next row starts after the double newline
+        row_slices.push(&s[start..boundary]);
         start = boundary + 2;
     }
 
     // Handle remaining data after final "\n\n" boundary (if any)
     if start < s.len() {
-        // There's trailing data that forms another row
         row_slices.push(&s[start..]);
     }
-    // If start == s.len(), the string ended exactly with "\n\n" and we're done
 
-    // Parse rows in parallel
+    // Parse in parallel, with empty row detection
+    // Common case (no empty rows): one parse_row call per slice
+    // Rare case (empty rows): detect and split further
     row_slices
         .par_iter()
-        .map(|&row_str| parse_row(row_str))
+        .flat_map(|&slice| {
+            // Check if slice starts with \n (indicates missed empty row before it)
+            if slice.starts_with('\n') {
+                // We missed an empty row - add it and parse the rest
+                let mut result = vec![Vec::new()];  // Empty row
+                if slice.len() > 1 {
+                    let rest = &slice[1..];
+                    if rest.contains("\n\n") {
+                        result.extend(split_empty_rows(rest));
+                    } else {
+                        result.push(parse_row(rest));
+                    }
+                }
+                result
+            } else if slice.contains("\n\n") {
+                // Slow path: slice contains \n\n (happens with \n\n\n pattern)
+                // Split to handle empty rows correctly
+                split_empty_rows(slice)
+            } else {
+                // Fast path: no consecutive \n within the slice (no empty rows)
+                vec![parse_row(slice)]
+            }
+        })
         .collect()
+}
+
+/// Handle slices that contain empty rows (rare case)
+fn split_empty_rows(s: &str) -> Vec<Vec<String>> {
+    // This only runs for slices with \n\n inside them
+    // (which means we hit \n\n\n+ pattern)
+    // Use split() to handle all the edge cases
+    s.split("\n\n").map(parse_row).collect()
 }
 
 /// Parse a single row from a string slice
