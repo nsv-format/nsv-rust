@@ -11,3 +11,12 @@ categories = ["parsing", "data-structures"]
 authors = ["naming"]
 
 [dependencies]
+rayon = "1.10"
+memchr = "2.7"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "parse"
+harness = false
