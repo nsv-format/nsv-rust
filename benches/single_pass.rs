@@ -1,5 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use nsv::{dumps, loads};
+use rayon::prelude::*;
 
 fn generate_test_data(rows: usize, cells_per_row: usize) -> Vec<Vec<String>> {
     (0..rows)
@@ -11,7 +12,7 @@ fn generate_test_data(rows: usize, cells_per_row: usize) -> Vec<Vec<String>> {
         .collect()
 }
 
-// Experimental single-pass parser
+// Experimental single-pass parser WITH parallelism
 fn loads_single_pass(s: &str) -> Vec<Vec<String>> {
     use memchr::memchr_iter;
 
@@ -21,7 +22,7 @@ fn loads_single_pass(s: &str) -> Vec<Vec<String>> {
 
     let bytes = s.as_bytes();
 
-    // Find all newline positions with SIMD
+    // Find all newline positions with SIMD - this is the ONLY scan we need
     let newlines: Vec<usize> = memchr_iter(b'\n', bytes).collect();
 
     if newlines.is_empty() {
@@ -29,48 +30,91 @@ fn loads_single_pass(s: &str) -> Vec<Vec<String>> {
         return vec![vec![unescape_single_pass(s)]];
     }
 
-    let mut result = Vec::new();
-    let mut current_row = Vec::new();
-    let mut cell_start = 0;
-
+    // Identify row boundaries (where next newline is consecutive)
+    let mut row_boundaries = Vec::new();
     for i in 0..newlines.len() {
-        let nl_pos = newlines[i];
-
-        // Check if next position is also a newline (row boundary)
-        let is_row_boundary = i + 1 < newlines.len() && newlines[i + 1] == nl_pos + 1;
-
-        if is_row_boundary {
-            // This is first \n of \n\n
-            let cell_text = &s[cell_start..nl_pos];
-            if !cell_text.is_empty() || cell_start == nl_pos {
-                current_row.push(unescape_single_pass(cell_text));
-            }
-            result.push(current_row);
-            current_row = Vec::new();
-            cell_start = newlines[i + 1] + 1; // Skip past both newlines
-            // Note: we'll process the second \n in next iteration but skip it
-        } else if i > 0 && newlines[i - 1] == nl_pos - 1 {
-            // This is second \n of \n\n, already handled
-            continue;
-        } else {
-            // Regular cell boundary
-            let cell_text = &s[cell_start..nl_pos];
-            current_row.push(unescape_single_pass(cell_text));
-            cell_start = nl_pos + 1;
+        if i + 1 < newlines.len() && newlines[i + 1] == newlines[i] + 1 {
+            // Found \n\n at newlines[i]
+            row_boundaries.push(i); // Store index in newlines array
         }
     }
 
-    // Handle trailing data
-    if cell_start < s.len() {
-        let cell_text = &s[cell_start..];
-        current_row.push(unescape_single_pass(cell_text));
+    if row_boundaries.is_empty() {
+        // Single row, all newlines are cell boundaries
+        return vec![parse_row_with_positions(s, &newlines, 0, newlines.len())];
     }
 
-    if !current_row.is_empty() {
-        result.push(current_row);
+    // Build row ranges in the newlines array
+    let mut row_ranges = Vec::new();
+    let mut start = 0;
+
+    for &boundary_idx in &row_boundaries {
+        row_ranges.push((start, boundary_idx));
+        start = boundary_idx + 2; // Skip past both newlines of \n\n
     }
 
-    result
+    // Handle last row
+    if start < newlines.len() {
+        row_ranges.push((start, newlines.len()));
+    }
+
+    // Parse rows in parallel using pre-found newline positions
+    row_ranges
+        .par_iter()
+        .map(|&(start_idx, end_idx)| {
+            let row_start = if start_idx == 0 { 0 } else { newlines[start_idx - 1] + 1 };
+            let row_end = if end_idx == 0 { 0 } else { newlines[end_idx - 1] };
+
+            parse_row_with_positions(s, &newlines, start_idx, end_idx)
+        })
+        .collect()
+}
+
+// Parse a row given its cell boundary positions
+fn parse_row_with_positions(s: &str, all_newlines: &[usize], start_idx: usize, end_idx: usize) -> Vec<String> {
+    if start_idx >= end_idx {
+        // No cell boundaries in this row
+        let row_start = if start_idx == 0 { 0 } else { all_newlines[start_idx - 1] + 1 };
+        let row_end = s.len();
+        if row_start < row_end {
+            return vec![unescape_single_pass(&s[row_start..row_end])];
+        }
+        return Vec::new();
+    }
+
+    let mut cells = Vec::new();
+    let row_start = if start_idx == 0 { 0 } else { all_newlines[start_idx - 1] + 1 };
+
+    // First cell
+    cells.push(unescape_single_pass(&s[row_start..all_newlines[start_idx]]));
+
+    // Middle cells
+    for i in start_idx..end_idx - 1 {
+        let cell_start = all_newlines[i] + 1;
+        let cell_end = all_newlines[i + 1];
+        if cell_start <= cell_end {
+            cells.push(unescape_single_pass(&s[cell_start..cell_end]));
+        }
+    }
+
+    // Last cell (if not at row boundary)
+    let last_nl = all_newlines[end_idx - 1];
+    if end_idx < all_newlines.len() && all_newlines[end_idx] == last_nl + 1 {
+        // This is a row boundary, we're done
+    } else {
+        // There's content after last newline in this row
+        let cell_start = last_nl + 1;
+        let row_end = if end_idx < all_newlines.len() {
+            all_newlines[end_idx]
+        } else {
+            s.len()
+        };
+        if cell_start < row_end {
+            cells.push(unescape_single_pass(&s[cell_start..row_end]));
+        }
+    }
+
+    cells
 }
 
 fn unescape_single_pass(s: &str) -> String {
