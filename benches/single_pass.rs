@@ -12,7 +12,7 @@ fn generate_test_data(rows: usize, cells_per_row: usize) -> Vec<Vec<String>> {
         .collect()
 }
 
-// Experimental single-pass parser WITH parallelism
+// Experimental: Find all newlines AND backslashes upfront, skip unescape when possible
 fn loads_single_pass(s: &str) -> Vec<Vec<String>> {
     use memchr::memchr_iter;
 
@@ -22,99 +22,136 @@ fn loads_single_pass(s: &str) -> Vec<Vec<String>> {
 
     let bytes = s.as_bytes();
 
-    // Find all newline positions with SIMD - this is the ONLY scan we need
+    // Two SIMD scans: find ALL newlines and ALL backslashes
     let newlines: Vec<usize> = memchr_iter(b'\n', bytes).collect();
+    let backslashes: Vec<usize> = memchr_iter(b'\\', bytes).collect();
 
     if newlines.is_empty() {
-        // Single cell, no newlines
-        return vec![vec![unescape_single_pass(s)]];
+        // Single cell
+        let needs_unescape = !backslashes.is_empty();
+        if needs_unescape {
+            return vec![vec![unescape_single_pass(s)]];
+        } else {
+            return vec![vec![s.to_string()]];
+        }
     }
 
-    // Identify row boundaries (where next newline is consecutive)
+    // Identify row boundaries
     let mut row_boundaries = Vec::new();
-    for i in 0..newlines.len() {
-        if i + 1 < newlines.len() && newlines[i + 1] == newlines[i] + 1 {
-            // Found \n\n at newlines[i]
-            row_boundaries.push(i); // Store index in newlines array
+    for i in 0..newlines.len() - 1 {
+        if newlines[i + 1] == newlines[i] + 1 {
+            row_boundaries.push(i);
         }
     }
 
     if row_boundaries.is_empty() {
-        // Single row, all newlines are cell boundaries
-        return vec![parse_row_with_positions(s, &newlines, 0, newlines.len())];
+        // Single row
+        return vec![parse_row_fast(s, &newlines, &backslashes, 0, newlines.len())];
     }
 
-    // Build row ranges in the newlines array
+    // Build row ranges
     let mut row_ranges = Vec::new();
     let mut start = 0;
 
     for &boundary_idx in &row_boundaries {
         row_ranges.push((start, boundary_idx));
-        start = boundary_idx + 2; // Skip past both newlines of \n\n
+        start = boundary_idx + 2;
     }
 
-    // Handle last row
     if start < newlines.len() {
         row_ranges.push((start, newlines.len()));
     }
 
-    // Parse rows in parallel using pre-found newline positions
+    // Parse rows in parallel
     row_ranges
         .par_iter()
         .map(|&(start_idx, end_idx)| {
-            let row_start = if start_idx == 0 { 0 } else { newlines[start_idx - 1] + 1 };
-            let row_end = if end_idx == 0 { 0 } else { newlines[end_idx - 1] };
-
-            parse_row_with_positions(s, &newlines, start_idx, end_idx)
+            parse_row_fast(s, &newlines, &backslashes, start_idx, end_idx)
         })
         .collect()
 }
 
-// Parse a row given its cell boundary positions
-fn parse_row_with_positions(s: &str, all_newlines: &[usize], start_idx: usize, end_idx: usize) -> Vec<String> {
+// Parse row with fast path for cells without backslashes
+fn parse_row_fast(s: &str, newlines: &[usize], backslashes: &[usize], start_idx: usize, end_idx: usize) -> Vec<String> {
     if start_idx >= end_idx {
-        // No cell boundaries in this row
-        let row_start = if start_idx == 0 { 0 } else { all_newlines[start_idx - 1] + 1 };
+        // Empty row or single cell without newline
+        let row_start = if start_idx == 0 { 0 } else { newlines[start_idx - 1] + 1 };
         let row_end = s.len();
-        if row_start < row_end {
-            return vec![unescape_single_pass(&s[row_start..row_end])];
+        if row_start >= row_end {
+            return Vec::new();
         }
-        return Vec::new();
+
+        let has_backslash = has_backslash_in_range(backslashes, row_start, row_end);
+        if has_backslash {
+            return vec![unescape_single_pass(&s[row_start..row_end])];
+        } else {
+            return vec![s[row_start..row_end].to_string()];
+        }
     }
 
     let mut cells = Vec::new();
-    let row_start = if start_idx == 0 { 0 } else { all_newlines[start_idx - 1] + 1 };
+    let row_start = if start_idx == 0 { 0 } else { newlines[start_idx - 1] + 1 };
 
-    // First cell
-    cells.push(unescape_single_pass(&s[row_start..all_newlines[start_idx]]));
+    // Binary search to find first backslash >= row_start
+    let mut bs_idx = match backslashes.binary_search(&row_start) {
+        Ok(idx) => idx,
+        Err(idx) => idx,
+    };
 
-    // Middle cells
-    for i in start_idx..end_idx - 1 {
-        let cell_start = all_newlines[i] + 1;
-        let cell_end = all_newlines[i + 1];
-        if cell_start <= cell_end {
-            cells.push(unescape_single_pass(&s[cell_start..cell_end]));
+    // Process each cell
+    let mut cell_start = row_start;
+    for i in start_idx..end_idx {
+        let cell_end = newlines[i];
+
+        // Advance bs_idx to first backslash >= cell_start
+        while bs_idx < backslashes.len() && backslashes[bs_idx] < cell_start {
+            bs_idx += 1;
         }
+
+        // Check if there's a backslash in [cell_start, cell_end)
+        let has_backslash = bs_idx < backslashes.len() && backslashes[bs_idx] < cell_end;
+
+        if has_backslash {
+            cells.push(unescape_single_pass(&s[cell_start..cell_end]));
+        } else {
+            cells.push(s[cell_start..cell_end].to_string());
+        }
+
+        cell_start = cell_end + 1;
     }
 
-    // Last cell (if not at row boundary)
-    let last_nl = all_newlines[end_idx - 1];
-    if end_idx < all_newlines.len() && all_newlines[end_idx] == last_nl + 1 {
-        // This is a row boundary, we're done
-    } else {
-        // There's content after last newline in this row
-        let cell_start = last_nl + 1;
-        let row_end = if end_idx < all_newlines.len() {
-            all_newlines[end_idx]
+    // Handle trailing cell
+    if cell_start < s.len() {
+        let cell_end = if end_idx < newlines.len() {
+            newlines[end_idx]
         } else {
             s.len()
         };
-        if cell_start < row_end {
-            cells.push(unescape_single_pass(&s[cell_start..row_end]));
+
+        if cell_start < cell_end {
+            while bs_idx < backslashes.len() && backslashes[bs_idx] < cell_start {
+                bs_idx += 1;
+            }
+            let has_backslash = bs_idx < backslashes.len() && backslashes[bs_idx] < cell_end;
+
+            if has_backslash {
+                cells.push(unescape_single_pass(&s[cell_start..cell_end]));
+            } else {
+                cells.push(s[cell_start..cell_end].to_string());
+            }
         }
     }
 
     cells
+}
+
+// Binary search to check if any backslash in range [start, end)
+fn has_backslash_in_range(backslashes: &[usize], start: usize, end: usize) -> bool {
+    let idx = match backslashes.binary_search(&start) {
+        Ok(idx) => return true, // Exact match at start
+        Err(idx) => idx,
+    };
+    idx < backslashes.len() && backslashes[idx] < end
 }
 
 fn unescape_single_pass(s: &str) -> String {
