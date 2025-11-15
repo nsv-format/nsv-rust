@@ -29,6 +29,50 @@ fn generate_test_data_with_multiline(rows: usize, cells_per_row: usize) -> Vec<V
         .collect()
 }
 
+fn generate_test_data_with_commas(rows: usize, cells_per_row: usize) -> Vec<Vec<String>> {
+    (0..rows)
+        .map(|i| {
+            (0..cells_per_row)
+                .map(|j| format!("item{}, variant{}, category{}", i, j, i + j))
+                .collect()
+        })
+        .collect()
+}
+
+fn generate_test_data_with_quotes(rows: usize, cells_per_row: usize) -> Vec<Vec<String>> {
+    (0..rows)
+        .map(|i| {
+            (0..cells_per_row)
+                .map(|j| format!(r#"He said "hello" at row {} col {}"#, i, j))
+                .collect()
+        })
+        .collect()
+}
+
+fn generate_test_data_mixed_special(rows: usize, cells_per_row: usize) -> Vec<Vec<String>> {
+    let patterns = [
+        r#"John "Johnny" Doe, Jr."#,
+        "Email: user@example.com",
+        "Description:\nMulti-line\nText here",
+        r#"Quote: "To be or not to be""#,
+        r"Path: C:\Users\Documents",
+        "Data: value1, value2, value3",
+        "",
+        "Normal text without special chars",
+    ];
+
+    (0..rows)
+        .map(|i| {
+            (0..cells_per_row)
+                .map(|j| {
+                    let pattern_idx = (i * cells_per_row + j) % patterns.len();
+                    format!("{} [r{}c{}]", patterns[pattern_idx], i, j)
+                })
+                .collect()
+        })
+        .collect()
+}
+
 fn data_to_csv(data: &[Vec<String>]) -> String {
     let mut wtr = WriterBuilder::new().from_writer(vec![]);
     for row in data {
@@ -118,11 +162,71 @@ fn bench_comparison_wide(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_comparison_with_commas(c: &mut Criterion) {
+    let mut group = c.benchmark_group("comparison_with_commas_10k");
+
+    let data = generate_test_data_with_commas(10_000, 10);
+    let nsv_str = dumps(&data);
+    let csv_str = data_to_csv(&data);
+
+    println!("\n=== Data with Commas (10K rows x 10 cols) ===");
+    println!("NSV size: {} bytes", nsv_str.len());
+    println!("CSV size: {} bytes", csv_str.len());
+    println!("Size ratio (CSV/NSV): {:.2}x", csv_str.len() as f64 / nsv_str.len() as f64);
+
+    group.bench_function("nsv_parse", |b| b.iter(|| loads(black_box(&nsv_str))));
+
+    group.bench_function("csv_parse", |b| b.iter(|| csv_to_data(black_box(&csv_str))));
+
+    group.finish();
+}
+
+fn bench_comparison_with_quotes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("comparison_with_quotes_10k");
+
+    let data = generate_test_data_with_quotes(10_000, 10);
+    let nsv_str = dumps(&data);
+    let csv_str = data_to_csv(&data);
+
+    println!("\n=== Data with Quotes (10K rows x 10 cols) ===");
+    println!("NSV size: {} bytes", nsv_str.len());
+    println!("CSV size: {} bytes", csv_str.len());
+    println!("Size ratio (CSV/NSV): {:.2}x", csv_str.len() as f64 / nsv_str.len() as f64);
+
+    group.bench_function("nsv_parse", |b| b.iter(|| loads(black_box(&nsv_str))));
+
+    group.bench_function("csv_parse", |b| b.iter(|| csv_to_data(black_box(&csv_str))));
+
+    group.finish();
+}
+
+fn bench_comparison_mixed_special(c: &mut Criterion) {
+    let mut group = c.benchmark_group("comparison_mixed_special_10k");
+
+    let data = generate_test_data_mixed_special(10_000, 10);
+    let nsv_str = dumps(&data);
+    let csv_str = data_to_csv(&data);
+
+    println!("\n=== Mixed Special Characters (10K rows x 10 cols) ===");
+    println!("NSV size: {} bytes", nsv_str.len());
+    println!("CSV size: {} bytes", csv_str.len());
+    println!("Size ratio (CSV/NSV): {:.2}x", csv_str.len() as f64 / nsv_str.len() as f64);
+
+    group.bench_function("nsv_parse", |b| b.iter(|| loads(black_box(&nsv_str))));
+
+    group.bench_function("csv_parse", |b| b.iter(|| csv_to_data(black_box(&csv_str))));
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_comparison_simple,
     bench_comparison_large,
     bench_comparison_multiline,
-    bench_comparison_wide
+    bench_comparison_wide,
+    bench_comparison_with_commas,
+    bench_comparison_with_quotes,
+    bench_comparison_mixed_special
 );
 criterion_main!(benches);
