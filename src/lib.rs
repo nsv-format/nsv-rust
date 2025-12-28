@@ -165,11 +165,6 @@ fn parse_row(row_str: &str) -> Vec<String> {
     cells
 }
 
-/// Unescape a single NSV cell value.
-///
-/// Interprets `\` as empty string, `\\` as literal backslash, and `\n` as newline.
-/// Unrecognized escape sequences are passed through with the literal backslash.
-/// Dangling backslash at end of string is stripped.
 pub fn unescape(s: &str) -> String {
     if s == "\\" {
         return String::new();
@@ -203,10 +198,6 @@ pub fn unescape(s: &str) -> String {
     out
 }
 
-/// Escape a single NSV cell value.
-///
-/// Empty strings become `\`, backslashes become `\\`, newlines become `\n`.
-/// Strings without special characters are returned as-is.
 pub fn escape(s: &str) -> String {
     if s.is_empty() {
         return "\\".to_string();
