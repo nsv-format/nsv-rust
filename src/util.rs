@@ -365,4 +365,212 @@ mod tests {
 
         assert_eq!(original, decoded);
     }
+
+    // =========================================================================
+    // Test spill invertibility (matching Python's test_spill.py)
+    // =========================================================================
+
+    #[test]
+    fn test_spill_invertibility() {
+        // Test unspill ∘ spill = id for properly terminated sequences
+        let cases: Vec<Vec<Vec<String>>> = vec![
+            vec![],                                           // Empty seqseq
+            vec![vec![]],                                     // Single empty row
+            vec![vec![], vec![]],                             // Two empty rows
+            vec![vec!["a".into()]],                           // Single element
+            vec![vec!["a".into(), "b".into()], vec!["c".into()]], // Multiple rows
+            vec![vec!["a".into()], vec![], vec!["b".into()]], // Mixed empty/non-empty
+        ];
+
+        for seqseq in cases {
+            let spilled = spill(&seqseq, String::new());
+            let recovered = unspill(&spilled, &String::new());
+            assert_eq!(seqseq, recovered, "Failed for {:?}", seqseq);
+        }
+    }
+
+    #[test]
+    fn test_unspill_invertibility() {
+        // Test spill ∘ unspill = id for properly terminated sequences
+        let cases: Vec<Vec<String>> = vec![
+            vec![],                                                     // Empty sequence
+            vec!["".into()],                                            // Single terminator (one empty row)
+            vec!["".into(), "".into()],                                 // Two empty rows
+            vec!["a".into(), "".into()],                                // Single element, one row
+            vec!["a".into(), "b".into(), "".into(), "c".into(), "".into()], // Multiple rows
+            vec!["a".into(), "".into(), "".into(), "b".into(), "".into()],  // Empty row in middle
+        ];
+
+        for seq in cases {
+            let unspilled = unspill(&seq, &String::new());
+            let recovered = spill(&unspilled, String::new());
+            assert_eq!(seq, recovered, "Failed for {:?}", seq);
+        }
+    }
+
+    #[test]
+    fn test_spill_with_different_types() {
+        // Test spill[T, marker] works with different types
+
+        // spill[String, ""]
+        let strings_2d = vec![vec!["a".to_string(), "b".to_string()], vec!["c".to_string()]];
+        let result = spill(&strings_2d, String::new());
+        let expected: Vec<String> = vec!["a".into(), "b".into(), "".into(), "c".into(), "".into()];
+        assert_eq!(expected, result);
+
+        // spill[char, '\n'] - using generic spill with chars
+        let chars_2d: Vec<Vec<char>> = vec![
+            vec!['h', 'e', 'l', 'l', 'o'],
+            vec!['w', 'o', 'r', 'l', 'd'],
+        ];
+        let result = spill(&chars_2d, '\n');
+        let expected: Vec<char> = vec!['h', 'e', 'l', 'l', 'o', '\n', 'w', 'o', 'r', 'l', 'd', '\n'];
+        assert_eq!(expected, result);
+
+        // spill[i32, -1]
+        let ints: Vec<Vec<i32>> = vec![vec![1, 2], vec![3]];
+        let result = spill(&ints, -1);
+        let expected: Vec<i32> = vec![1, 2, -1, 3, -1];
+        assert_eq!(expected, result);
+    }
+
+    // =========================================================================
+    // Test decomposition (matching Python's test_composition.py)
+    // =========================================================================
+
+    /// Sample data matching Python's test_utils.SAMPLES_DATA
+    fn get_samples_data() -> Vec<(&'static str, Vec<Vec<String>>)> {
+        vec![
+            ("empty", vec![]),
+            ("empty_one", vec![vec![]]),
+            ("empty_two", vec![vec![], vec![]]),
+            ("empty_three", vec![vec![], vec![], vec![]]),
+            ("basic", vec![
+                vec!["a".into(), "b".into(), "c".into()],
+                vec!["d".into(), "e".into(), "f".into()],
+            ]),
+            ("comments", vec![
+                vec!["# This is a comment".into(), "// Another comment".into(), "-- And another".into()],
+                vec!["---".into()],
+                vec!["r1c1".into(), "r1c2".into()],
+                vec!["r2c1".into(), "r2c2".into()],
+            ]),
+            ("empty_fields", vec![
+                vec!["r1c1".into(), "".into(), "r1c3".into()],
+                vec!["r2c1".into(), "".into(), "r2c3".into()],
+            ]),
+            ("empty_sequence", vec![
+                vec!["r1c1".into(), "r1c2".into()],
+                vec![],
+                vec!["r3c1".into(), "r3c2".into()],
+            ]),
+            ("empty_sequence_end", vec![
+                vec!["r1c1".into(), "r1c2".into()],
+                vec!["r2c1".into(), "r2c2".into()],
+                vec![],
+            ]),
+            ("empty_sequence_start", vec![
+                vec![],
+                vec!["r2c1".into(), "r2c2".into()],
+                vec!["r3c1".into(), "r3c2".into()],
+            ]),
+            ("special_chars", vec![
+                vec!["field with spaces".into(), "field,with,commas".into(), "field\twith\ttabs".into()],
+                vec!["field\"with\"quotes".into(), "field'with'quotes".into(), "field\\with\\backslashes".into()],
+                vec!["field\nwith\nnewlines".into(), "field, just field".into()],
+            ]),
+            ("multiple_empty_sequences", vec![
+                vec![],
+                vec!["r2c1".into(), "r2c2".into()],
+                vec![],
+                vec![],
+                vec!["r5c1".into(), "r5c2".into(), "r5c3".into()],
+                vec![],
+            ]),
+            ("multiline_encoded", vec![
+                vec!["line1\nline2".into(), "r1c2".into(), "r1c3".into()],
+                vec!["anotherline1\nline2\nline3".into(), "r2c2".into()],
+            ]),
+            ("escape_edge_cases", vec![
+                vec!["\\n".into(), "\\\n".into(), "\\\\n".into()],
+                vec!["\\\\".into(), "\n\n".into()],
+            ]),
+            ("one_one", vec![vec!["".into()]]),
+        ]
+    }
+
+    #[test]
+    fn test_encode_decomposition() {
+        // Test dumps = spill[Char, '\n'] ∘ spill[String, ''] ∘ escape_seqseq
+        for (name, seqseq) in get_samples_data() {
+            let expected = crate::dumps(&seqseq);
+
+            // Decomposed encoding
+            let escaped = escape_seqseq(&seqseq);
+            let spilled_structure = spill(&escaped, String::new());
+            let actual: String = spill_chars(&spilled_structure).into_iter().collect();
+
+            assert_eq!(expected, actual, "Encode decomposition failed for sample: {}", name);
+        }
+    }
+
+    #[test]
+    fn test_decode_decomposition() {
+        // Test loads = unescape_seqseq ∘ unspill[String, ''] ∘ unspill[Char, '\n']
+        for (name, seqseq) in get_samples_data() {
+            let encoded = crate::dumps(&seqseq);
+            let expected = crate::loads(&encoded);
+
+            // Decomposed decoding
+            let chars: Vec<char> = encoded.chars().collect();
+            let deserialized = unspill_chars(&chars);
+            let unspilled_structure = unspill(&deserialized, &String::new());
+            let actual = unescape_seqseq(&unspilled_structure);
+
+            assert_eq!(expected, actual, "Decode decomposition failed for sample: {}", name);
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_decomposition_roundtrip() {
+        // Verify that decomposed encode then decomposed decode = identity
+        for (name, original) in get_samples_data() {
+            // Encode via decomposition
+            let escaped = escape_seqseq(&original);
+            let spilled_structure = spill(&escaped, String::new());
+            let encoded: String = spill_chars(&spilled_structure).into_iter().collect();
+
+            // Decode via decomposition
+            let chars: Vec<char> = encoded.chars().collect();
+            let deserialized = unspill_chars(&chars);
+            let unspilled_structure = unspill(&deserialized, &String::new());
+            let decoded = unescape_seqseq(&unspilled_structure);
+
+            assert_eq!(original, decoded, "Roundtrip failed for sample: {}", name);
+        }
+    }
+
+    #[test]
+    fn test_decomposition_matches_direct_impl() {
+        // Verify decomposition matches the direct loads/dumps implementation
+        for (name, original) in get_samples_data() {
+            // Direct implementation
+            let direct_encoded = crate::dumps(&original);
+            let direct_decoded = crate::loads(&direct_encoded);
+
+            // Decomposed implementation
+            let escaped = escape_seqseq(&original);
+            let spilled_structure = spill(&escaped, String::new());
+            let decomposed_encoded: String = spill_chars(&spilled_structure).into_iter().collect();
+
+            let chars: Vec<char> = decomposed_encoded.chars().collect();
+            let deserialized = unspill_chars(&chars);
+            let unspilled_structure = unspill(&deserialized, &String::new());
+            let decomposed_decoded = unescape_seqseq(&unspilled_structure);
+
+            assert_eq!(direct_encoded, decomposed_encoded, "Encoding mismatch for sample: {}", name);
+            assert_eq!(direct_decoded, decomposed_decoded, "Decoding mismatch for sample: {}", name);
+            assert_eq!(original, decomposed_decoded, "Roundtrip mismatch for sample: {}", name);
+        }
+    }
 }
