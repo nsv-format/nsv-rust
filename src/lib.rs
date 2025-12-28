@@ -13,6 +13,8 @@
 //!
 //! For smaller files, we use a sequential fast path to avoid thread overhead.
 
+pub mod util;
+
 use memchr::memmem;
 use rayon::prelude::*;
 
@@ -163,7 +165,12 @@ fn parse_row(row_str: &str) -> Vec<String> {
     cells
 }
 
-fn unescape(s: &str) -> String {
+/// Unescape a single NSV cell value.
+///
+/// Interprets `\` as empty string, `\\` as literal backslash, and `\n` as newline.
+/// Unrecognized escape sequences are passed through with the literal backslash.
+/// Dangling backslash at end of string is stripped.
+pub fn unescape(s: &str) -> String {
     if s == "\\" {
         return String::new();
     }
@@ -196,7 +203,11 @@ fn unescape(s: &str) -> String {
     out
 }
 
-fn escape(s: &str) -> String {
+/// Escape a single NSV cell value.
+///
+/// Empty strings become `\`, backslashes become `\\`, newlines become `\n`.
+/// Strings without special characters are returned as-is.
+pub fn escape(s: &str) -> String {
     if s.is_empty() {
         return "\\".to_string();
     }
