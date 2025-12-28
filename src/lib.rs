@@ -13,6 +13,8 @@
 //!
 //! For smaller files, we use a sequential fast path to avoid thread overhead.
 
+pub mod util;
+
 use memchr::memmem;
 use rayon::prelude::*;
 
@@ -163,7 +165,7 @@ fn parse_row(row_str: &str) -> Vec<String> {
     cells
 }
 
-fn unescape(s: &str) -> String {
+pub fn unescape(s: &str) -> String {
     if s == "\\" {
         return String::new();
     }
@@ -196,7 +198,7 @@ fn unescape(s: &str) -> String {
     out
 }
 
-fn escape(s: &str) -> String {
+pub fn escape(s: &str) -> String {
     if s.is_empty() {
         return "\\".to_string();
     }
