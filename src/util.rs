@@ -48,34 +48,21 @@ pub fn unspill<T: Clone + PartialEq>(seq: &[T], marker: &T) -> Vec<Vec<T>> {
     seqseq
 }
 
-/// Spill strings to chars with newline marker.
-pub fn spill_chars(strings: &[String]) -> Vec<char> {
-    let mut chars = Vec::new();
-    for s in strings {
-        chars.extend(s.chars());
-        chars.push('\n');
-    }
-    chars
-}
-
-/// Unspill chars to strings with newline marker.
-pub fn unspill_chars(chars: &[char]) -> Vec<String> {
-    let mut strings = Vec::new();
-    let mut current = String::new();
-    for &c in chars {
-        if c != '\n' {
-            current.push(c);
-        } else {
-            strings.push(current);
-            current = String::new();
-        }
-    }
-    strings
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode(seqseq: &[Vec<String>]) -> String {
+        let escaped = escape_seqseq(seqseq);
+        let spilled = spill(&escaped, String::new());
+        spilled.iter().flat_map(|s| s.chars().chain(std::iter::once('\n'))).collect()
+    }
+
+    fn decode(s: &str) -> Vec<Vec<String>> {
+        let mut strings: Vec<String> = s.split('\n').map(|s| s.to_string()).collect();
+        strings.pop(); // Remove trailing element from split
+        unescape_seqseq(&unspill(&strings, &String::new()))
+    }
 
     #[test]
     fn test_escape_unescape_seqseq() {
@@ -104,7 +91,6 @@ mod tests {
             assert_eq!(unspill(&spilled, &String::new()), seqseq);
         }
 
-        // Also test with different types
         let ints: Vec<Vec<i32>> = vec![vec![1, 2], vec![3]];
         assert_eq!(spill(&ints, -1), vec![1, 2, -1, 3, -1]);
     }
@@ -115,79 +101,48 @@ mod tests {
         assert!(unspill(&input, &String::new()).is_empty());
     }
 
-    fn get_samples() -> Vec<(&'static str, Vec<Vec<String>>)> {
-        vec![
-            ("empty", vec![]),
-            ("empty_one", vec![vec![]]),
-            ("empty_rows", vec![vec![], vec![], vec![]]),
-            ("basic", vec![vec!["a".into(), "b".into()], vec!["c".into(), "d".into()]]),
-            ("empty_fields", vec![vec!["".into(), "x".into(), "".into()]]),
-            ("special_chars", vec![
-                vec!["field\\with\\backslashes".into(), "field\nwith\nnewlines".into()],
-            ]),
-            ("escape_edge_cases", vec![
-                vec!["\\n".into(), "\\\n".into(), "\\\\n".into()],
-                vec!["\\\\".into(), "\n\n".into()],
-            ]),
-        ]
-    }
-
     #[test]
     fn test_decomposition_matches_direct() {
-        for (name, seqseq) in get_samples() {
-            // Encode via decomposition
-            let escaped = escape_seqseq(&seqseq);
-            let spilled = spill(&escaped, String::new());
-            let encoded: String = spill_chars(&spilled).into_iter().collect();
-            assert_eq!(crate::dumps(&seqseq), encoded, "encode mismatch: {}", name);
-
-            // Decode via decomposition
-            let chars: Vec<char> = encoded.chars().collect();
-            let unspilled = unspill(&unspill_chars(&chars), &String::new());
-            let decoded = unescape_seqseq(&unspilled);
-            assert_eq!(seqseq, decoded, "roundtrip mismatch: {}", name);
+        let samples: Vec<Vec<Vec<String>>> = vec![
+            vec![],
+            vec![vec![]],
+            vec![vec![], vec![], vec![]],
+            vec![vec!["a".into(), "b".into()], vec!["c".into(), "d".into()]],
+            vec![vec!["".into(), "x".into(), "".into()]],
+            vec![vec!["field\\with\\backslashes".into(), "field\nwith\nnewlines".into()]],
+            vec![vec!["\\n".into(), "\\\n".into()], vec!["\\\\".into(), "\n\n".into()]],
+        ];
+        for seqseq in samples {
+            assert_eq!(crate::dumps(&seqseq), encode(&seqseq));
+            assert_eq!(seqseq, decode(&encode(&seqseq)));
         }
-    }
-
-    const PARALLEL_THRESHOLD: usize = 64 * 1024;
-
-    fn verify_large_roundtrip(original: &[Vec<String>]) {
-        let direct_encoded = crate::dumps(original);
-        assert!(direct_encoded.len() > PARALLEL_THRESHOLD);
-
-        let escaped = escape_seqseq(original);
-        let spilled = spill(&escaped, String::new());
-        let decomposed: String = spill_chars(&spilled).into_iter().collect();
-        assert_eq!(direct_encoded, decomposed);
-
-        let chars: Vec<char> = decomposed.chars().collect();
-        let decoded = unescape_seqseq(&unspill(&unspill_chars(&chars), &String::new()));
-        assert_eq!(original, decoded);
-        assert_eq!(crate::loads(&direct_encoded), decoded);
     }
 
     #[test]
     fn test_large_datasets() {
-        // Simple large dataset
+        let verify = |original: &[Vec<String>]| {
+            let direct = crate::dumps(original);
+            assert!(direct.len() > 64 * 1024);
+            assert_eq!(direct, encode(original));
+            assert_eq!(original, decode(&direct));
+            assert_eq!(crate::loads(&direct), decode(&direct));
+        };
+
         let simple: Vec<Vec<String>> = (0..10_000)
             .map(|i| vec![format!("row{}", i), format!("data{}", i)])
             .collect();
-        verify_large_roundtrip(&simple);
+        verify(&simple);
 
-        // With escapes
         let with_escapes: Vec<Vec<String>> = (0..10_000)
             .map(|i| vec![format!("line\n{}", i), format!("back\\{}", i), "".into()])
             .collect();
-        verify_large_roundtrip(&with_escapes);
+        verify(&with_escapes);
 
-        // With empty rows
         let mut with_empty = Vec::new();
         for i in 0..10_000 {
             with_empty.push(vec![format!("v{}", i)]);
-            if i % 100 == 0 {
-                with_empty.push(vec![]);
-            }
+            if i % 100 == 0 { with_empty.push(vec![]); }
         }
-        verify_large_roundtrip(&with_empty);
+        verify(&with_empty);
     }
 }
