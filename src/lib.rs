@@ -18,6 +18,8 @@ pub mod util;
 use memchr::memmem;
 use rayon::prelude::*;
 
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Threshold for using parallel parsing (64KB)
 const PARALLEL_THRESHOLD: usize = 64 * 1024;
 
