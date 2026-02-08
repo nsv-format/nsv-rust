@@ -230,29 +230,25 @@ pub fn dumps(data: &[Vec<String>]) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Warning {
     pub kind: WarningKind,
-    /// Byte offset in the input
     pub pos: usize,
-    /// 1-indexed line number
     pub line: usize,
-    /// 1-indexed column (byte offset within line)
     pub col: usize,
 }
 
-/// The kind of warning detected by [`check`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WarningKind {
-    /// `\x`, `\t`, `\r`, etc. — any `\` followed by a char that isn't `n` or `\`
+    /// `\` followed by a char other than `n` or `\`
     UnknownEscape(char),
-    /// `\` as the very last character of a line (before `\n` or EOF)
+    /// `\` immediately before LF or at EOF
     DanglingBackslash,
-    /// Input is non-empty but doesn't end with `\n`
-    NoTerminalNewline,
+    /// Non-empty input not ending with LF
+    NoTerminalLf,
 }
 
-/// Validate raw NSV input and report edge cases without altering parsing behavior.
+/// Report edge cases in raw NSV input without altering parsing behavior.
 ///
-/// `loads()` stays lenient and unchanged; `check()` is the opt-in strictness layer.
-/// It detects unknown escape sequences, dangling backslashes, and missing terminal newlines.
+/// Warns on unknown escape sequences, dangling backslashes, and missing terminal LF.
+/// Positions are byte offsets; line and col are 1-indexed.
 pub fn check(s: &str) -> Vec<Warning> {
     if s.is_empty() {
         return Vec::new();
@@ -270,7 +266,6 @@ pub fn check(s: &str) -> Vec<Warning> {
             b'\\' => {
                 let col = i - line_start + 1;
                 if i + 1 >= len {
-                    // Backslash at EOF
                     warnings.push(Warning {
                         kind: WarningKind::DanglingBackslash,
                         pos: i,
@@ -280,23 +275,17 @@ pub fn check(s: &str) -> Vec<Warning> {
                     i += 1;
                 } else {
                     match bytes[i + 1] {
-                        b'n' | b'\\' => {
-                            // Valid escape sequence (\n or \\)
-                            i += 2;
-                        }
+                        b'n' | b'\\' => i += 2,
                         b'\n' => {
-                            // Backslash immediately before newline
                             warnings.push(Warning {
                                 kind: WarningKind::DanglingBackslash,
                                 pos: i,
                                 line,
                                 col,
                             });
-                            // Let the next iteration handle the newline
                             i += 1;
                         }
                         _ => {
-                            // Unknown escape — decode the char after the backslash
                             let next_char = s[i + 1..].chars().next().unwrap();
                             warnings.push(Warning {
                                 kind: WarningKind::UnknownEscape(next_char),
@@ -320,10 +309,9 @@ pub fn check(s: &str) -> Vec<Warning> {
         }
     }
 
-    // Check for missing terminal newline
     if bytes[len - 1] != b'\n' {
         warnings.push(Warning {
-            kind: WarningKind::NoTerminalNewline,
+            kind: WarningKind::NoTerminalLf,
             pos: len,
             line,
             col: len - line_start + 1,
@@ -546,21 +534,18 @@ mod tests {
     }
 
     #[test]
-    fn test_check_just_newline() {
+    fn test_check_just_lf() {
         assert_eq!(check("\n"), vec![]);
     }
 
     #[test]
     fn test_check_no_issues() {
-        // Basic valid NSV — no escapes, properly terminated
         assert_eq!(check("col1\ncol2\n\na\nb\n\n"), vec![]);
-        // Valid with escape sequences (\\  and \n)
         assert_eq!(check("hello\\\\world\n\\n\n\n"), vec![]);
     }
 
     #[test]
     fn test_check_single_unknown_escape() {
-        // "hello\tworld\n" — \t at byte offset 5
         let warnings = check("hello\\tworld\n");
         assert_eq!(
             warnings,
@@ -575,7 +560,6 @@ mod tests {
 
     #[test]
     fn test_check_multiple_unknown_escapes_different_lines() {
-        // Line 1: \t at pos 0; Line 2: \r at pos 8
         let warnings = check("\\thello\n\\rworld\n\n");
         assert_eq!(
             warnings,
@@ -598,7 +582,6 @@ mod tests {
 
     #[test]
     fn test_check_dangling_backslash_mid_file() {
-        // Backslash immediately before \n on line 1
         let warnings = check("text\\\nmore\n\n");
         assert_eq!(
             warnings,
@@ -613,7 +596,6 @@ mod tests {
 
     #[test]
     fn test_check_dangling_backslash_at_eof() {
-        // Backslash as last byte — both dangling and no terminal newline
         let warnings = check("text\\");
         assert_eq!(
             warnings,
@@ -625,7 +607,7 @@ mod tests {
                     col: 5,
                 },
                 Warning {
-                    kind: WarningKind::NoTerminalNewline,
+                    kind: WarningKind::NoTerminalLf,
                     pos: 5,
                     line: 1,
                     col: 6,
@@ -635,12 +617,12 @@ mod tests {
     }
 
     #[test]
-    fn test_check_no_terminal_newline() {
+    fn test_check_no_terminal_lf() {
         let warnings = check("hello");
         assert_eq!(
             warnings,
             vec![Warning {
-                kind: WarningKind::NoTerminalNewline,
+                kind: WarningKind::NoTerminalLf,
                 pos: 5,
                 line: 1,
                 col: 6,
@@ -650,8 +632,7 @@ mod tests {
 
     #[test]
     fn test_check_combination() {
-        // \t unknown escape, dangling backslash before \n, then no terminal newline
-        // bytes: \(0) t(1) h(2) e(3) l(4) l(5) o(6) \(7) LF(8) w(9) o(10) r(11) l(12) d(13)
+        // \(0) t(1) h(2) e(3) l(4) l(5) o(6) \(7) LF(8) w(9) o(10) r(11) l(12) d(13)
         let warnings = check("\\thello\\\nworld");
         assert_eq!(
             warnings,
@@ -669,7 +650,7 @@ mod tests {
                     col: 8,
                 },
                 Warning {
-                    kind: WarningKind::NoTerminalNewline,
+                    kind: WarningKind::NoTerminalLf,
                     pos: 14,
                     line: 2,
                     col: 6,
