@@ -105,9 +105,9 @@ mod tests {
             let flat = spill(&escaped, String::new());
             let chars: Vec<char> = spill(&flat.iter().map(|s| s.chars().collect()).collect::<Vec<Vec<char>>>(), '\n');
             let encoded: String = chars.into_iter().collect();
-            assert_eq!(crate::dumps(original), encoded);
+            assert_eq!(crate::encode(original), encoded);
 
-            let decoded_chars: Vec<Vec<char>> = unspill(&crate::dumps(original).chars().collect::<Vec<_>>(), &'\n');
+            let decoded_chars: Vec<Vec<char>> = unspill(&crate::encode(original).chars().collect::<Vec<_>>(), &'\n');
             let decoded_strings: Vec<String> = decoded_chars.into_iter().map(|cs| cs.into_iter().collect()).collect();
             let decoded_rows = unspill(&decoded_strings, &String::new());
             assert_eq!(*original, unescape_seqseq(&decoded_rows));
@@ -126,7 +126,7 @@ mod tests {
         let encoded: String = chars.into_iter().collect();
 
         assert!(encoded.len() > 64 * 1024);
-        assert_eq!(crate::dumps(&original), encoded);
-        assert_eq!(crate::loads(&encoded), original);
+        assert_eq!(crate::encode(&original), encoded);
+        assert_eq!(crate::decode(&encoded), original);
     }
 }

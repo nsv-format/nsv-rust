@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use csv::{ReaderBuilder, WriterBuilder};
-use nsv::{dumps, loads};
+use nsv::{encode, decode};
 
 fn generate_test_data(rows: usize, cells_per_row: usize) -> Vec<Vec<String>> {
     (0..rows)
@@ -208,14 +208,14 @@ fn bench_comparison_simple(c: &mut Criterion) {
     let mut group = c.benchmark_group("comparison_simple_10k");
 
     let data = generate_test_data(10_000, 10);
-    let nsv_str = dumps(&data);
+    let nsv_str = encode(&data);
     let csv_str = data_to_csv(&data);
 
     println!("\n=== Simple Data (10K rows x 10 cols) ===");
     println!("NSV size: {} bytes", nsv_str.len());
     println!("CSV size: {} bytes", csv_str.len());
 
-    group.bench_function("nsv_parse", |b| b.iter(|| loads(black_box(&nsv_str))));
+    group.bench_function("nsv_parse", |b| b.iter(|| decode(black_box(&nsv_str))));
 
     group.bench_function("csv_parse", |b| b.iter(|| csv_to_data(black_box(&csv_str))));
 
@@ -226,14 +226,14 @@ fn bench_comparison_large(c: &mut Criterion) {
     let mut group = c.benchmark_group("comparison_large_100k");
 
     let data = generate_test_data(100_000, 10);
-    let nsv_str = dumps(&data);
+    let nsv_str = encode(&data);
     let csv_str = data_to_csv(&data);
 
     println!("\n=== Large Data (100K rows x 10 cols) ===");
     println!("NSV size: {} bytes", nsv_str.len());
     println!("CSV size: {} bytes", csv_str.len());
 
-    group.bench_function("nsv_parse", |b| b.iter(|| loads(black_box(&nsv_str))));
+    group.bench_function("nsv_parse", |b| b.iter(|| decode(black_box(&nsv_str))));
 
     group.bench_function("csv_parse", |b| b.iter(|| csv_to_data(black_box(&csv_str))));
 
@@ -244,14 +244,14 @@ fn bench_comparison_multiline(c: &mut Criterion) {
     let mut group = c.benchmark_group("comparison_multiline_10k");
 
     let data = generate_test_data_with_multiline(10_000, 10);
-    let nsv_str = dumps(&data);
+    let nsv_str = encode(&data);
     let csv_str = data_to_csv(&data);
 
     println!("\n=== Multiline Data (10K rows x 10 cols with newlines) ===");
     println!("NSV size: {} bytes", nsv_str.len());
     println!("CSV size: {} bytes", csv_str.len());
 
-    group.bench_function("nsv_parse", |b| b.iter(|| loads(black_box(&nsv_str))));
+    group.bench_function("nsv_parse", |b| b.iter(|| decode(black_box(&nsv_str))));
 
     group.bench_function("csv_parse", |b| b.iter(|| csv_to_data(black_box(&csv_str))));
 
@@ -262,14 +262,14 @@ fn bench_comparison_wide(c: &mut Criterion) {
     let mut group = c.benchmark_group("comparison_wide_1k");
 
     let data = generate_test_data(1_000, 100); // 1K rows, 100 columns
-    let nsv_str = dumps(&data);
+    let nsv_str = encode(&data);
     let csv_str = data_to_csv(&data);
 
     println!("\n=== Wide Data (1K rows x 100 cols) ===");
     println!("NSV size: {} bytes", nsv_str.len());
     println!("CSV size: {} bytes", csv_str.len());
 
-    group.bench_function("nsv_parse", |b| b.iter(|| loads(black_box(&nsv_str))));
+    group.bench_function("nsv_parse", |b| b.iter(|| decode(black_box(&nsv_str))));
 
     group.bench_function("csv_parse", |b| b.iter(|| csv_to_data(black_box(&csv_str))));
 
@@ -280,7 +280,7 @@ fn bench_comparison_with_commas(c: &mut Criterion) {
     let mut group = c.benchmark_group("comparison_with_commas_10k");
 
     let data = generate_test_data_with_commas(10_000, 10);
-    let nsv_str = dumps(&data);
+    let nsv_str = encode(&data);
     let csv_str = data_to_csv(&data);
 
     println!("\n=== Data with Commas (10K rows x 10 cols) ===");
@@ -288,7 +288,7 @@ fn bench_comparison_with_commas(c: &mut Criterion) {
     println!("CSV size: {} bytes", csv_str.len());
     println!("Size ratio (CSV/NSV): {:.2}x", csv_str.len() as f64 / nsv_str.len() as f64);
 
-    group.bench_function("nsv_parse", |b| b.iter(|| loads(black_box(&nsv_str))));
+    group.bench_function("nsv_parse", |b| b.iter(|| decode(black_box(&nsv_str))));
 
     group.bench_function("csv_parse", |b| b.iter(|| csv_to_data(black_box(&csv_str))));
 
@@ -299,7 +299,7 @@ fn bench_comparison_with_quotes(c: &mut Criterion) {
     let mut group = c.benchmark_group("comparison_with_quotes_10k");
 
     let data = generate_test_data_with_quotes(10_000, 10);
-    let nsv_str = dumps(&data);
+    let nsv_str = encode(&data);
     let csv_str = data_to_csv(&data);
 
     println!("\n=== Data with Quotes (10K rows x 10 cols) ===");
@@ -307,7 +307,7 @@ fn bench_comparison_with_quotes(c: &mut Criterion) {
     println!("CSV size: {} bytes", csv_str.len());
     println!("Size ratio (CSV/NSV): {:.2}x", csv_str.len() as f64 / nsv_str.len() as f64);
 
-    group.bench_function("nsv_parse", |b| b.iter(|| loads(black_box(&nsv_str))));
+    group.bench_function("nsv_parse", |b| b.iter(|| decode(black_box(&nsv_str))));
 
     group.bench_function("csv_parse", |b| b.iter(|| csv_to_data(black_box(&csv_str))));
 
@@ -318,7 +318,7 @@ fn bench_comparison_mixed_special(c: &mut Criterion) {
     let mut group = c.benchmark_group("comparison_mixed_special_10k");
 
     let data = generate_test_data_mixed_special(10_000, 10);
-    let nsv_str = dumps(&data);
+    let nsv_str = encode(&data);
     let csv_str = data_to_csv(&data);
 
     println!("\n=== Mixed Special Characters (10K rows x 10 cols) ===");
@@ -326,7 +326,7 @@ fn bench_comparison_mixed_special(c: &mut Criterion) {
     println!("CSV size: {} bytes", csv_str.len());
     println!("Size ratio (CSV/NSV): {:.2}x", csv_str.len() as f64 / nsv_str.len() as f64);
 
-    group.bench_function("nsv_parse", |b| b.iter(|| loads(black_box(&nsv_str))));
+    group.bench_function("nsv_parse", |b| b.iter(|| decode(black_box(&nsv_str))));
 
     group.bench_function("csv_parse", |b| b.iter(|| csv_to_data(black_box(&csv_str))));
 
@@ -337,7 +337,7 @@ fn bench_comparison_heavy_backslashes(c: &mut Criterion) {
     let mut group = c.benchmark_group("comparison_heavy_backslashes_10k");
 
     let data = generate_test_data_heavy_backslashes(10_000, 10);
-    let nsv_str = dumps(&data);
+    let nsv_str = encode(&data);
     let csv_str = data_to_csv(&data);
 
     println!("\n=== Heavy Backslashes - NSV Worst Case (10K rows x 10 cols) ===");
@@ -345,7 +345,7 @@ fn bench_comparison_heavy_backslashes(c: &mut Criterion) {
     println!("CSV size: {} bytes", csv_str.len());
     println!("Size ratio (CSV/NSV): {:.2}x", csv_str.len() as f64 / nsv_str.len() as f64);
 
-    group.bench_function("nsv_parse", |b| b.iter(|| loads(black_box(&nsv_str))));
+    group.bench_function("nsv_parse", |b| b.iter(|| decode(black_box(&nsv_str))));
 
     group.bench_function("csv_parse", |b| b.iter(|| csv_to_data(black_box(&csv_str))));
 
@@ -356,7 +356,7 @@ fn bench_comparison_heavy_newlines(c: &mut Criterion) {
     let mut group = c.benchmark_group("comparison_heavy_newlines_10k");
 
     let data = generate_test_data_heavy_newlines(10_000, 10);
-    let nsv_str = dumps(&data);
+    let nsv_str = encode(&data);
     let csv_str = data_to_csv(&data);
 
     println!("\n=== Heavy Newlines - NSV Worst Case (10K rows x 10 cols) ===");
@@ -364,7 +364,7 @@ fn bench_comparison_heavy_newlines(c: &mut Criterion) {
     println!("CSV size: {} bytes", csv_str.len());
     println!("Size ratio (CSV/NSV): {:.2}x", csv_str.len() as f64 / nsv_str.len() as f64);
 
-    group.bench_function("nsv_parse", |b| b.iter(|| loads(black_box(&nsv_str))));
+    group.bench_function("nsv_parse", |b| b.iter(|| decode(black_box(&nsv_str))));
 
     group.bench_function("csv_parse", |b| b.iter(|| csv_to_data(black_box(&csv_str))));
 
@@ -375,7 +375,7 @@ fn bench_comparison_realistic_table(c: &mut Criterion) {
     let mut group = c.benchmark_group("comparison_realistic_heterogeneous_10k");
 
     let data = generate_realistic_heterogeneous_table(10_000);
-    let nsv_str = dumps(&data);
+    let nsv_str = encode(&data);
     let csv_str = data_to_csv(&data);
 
     println!("\n=== Realistic Heterogeneous Table (10K rows x 8 varied cols) ===");
@@ -383,7 +383,7 @@ fn bench_comparison_realistic_table(c: &mut Criterion) {
     println!("CSV size: {} bytes", csv_str.len());
     println!("Size ratio (CSV/NSV): {:.2}x", csv_str.len() as f64 / nsv_str.len() as f64);
 
-    group.bench_function("nsv_parse", |b| b.iter(|| loads(black_box(&nsv_str))));
+    group.bench_function("nsv_parse", |b| b.iter(|| decode(black_box(&nsv_str))));
 
     group.bench_function("csv_parse", |b| b.iter(|| csv_to_data(black_box(&csv_str))));
 
@@ -394,7 +394,7 @@ fn bench_comparison_nested_encoding(c: &mut Criterion) {
     let mut group = c.benchmark_group("comparison_nested_encoding_10k");
 
     let data = generate_nested_encoding_data(10_000, 10);
-    let nsv_str = dumps(&data);
+    let nsv_str = encode(&data);
     let csv_str = data_to_csv(&data);
 
     println!("\n=== Nested Encoding - Both Formats Challenged (10K rows x 10 cols) ===");
@@ -402,7 +402,7 @@ fn bench_comparison_nested_encoding(c: &mut Criterion) {
     println!("CSV size: {} bytes", csv_str.len());
     println!("Size ratio (CSV/NSV): {:.2}x", csv_str.len() as f64 / nsv_str.len() as f64);
 
-    group.bench_function("nsv_parse", |b| b.iter(|| loads(black_box(&nsv_str))));
+    group.bench_function("nsv_parse", |b| b.iter(|| decode(black_box(&nsv_str))));
 
     group.bench_function("csv_parse", |b| b.iter(|| csv_to_data(black_box(&csv_str))));
 

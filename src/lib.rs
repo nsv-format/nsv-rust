@@ -23,32 +23,46 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Threshold for using parallel parsing (64KB)
 const PARALLEL_THRESHOLD: usize = 64 * 1024;
 
-pub fn loads(s: &str) -> Vec<Vec<String>> {
-    if s.is_empty() {
+/// Decode an NSV string into a seqseq.
+pub fn decode(s: &str) -> Vec<Vec<String>> {
+    decode_bytes(s.as_bytes())
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|cell| {
+                    // Safety: splitting/unescaping on ASCII bytes preserves UTF-8 validity.
+                    String::from_utf8(cell).unwrap()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Decode raw bytes into a seqseq of byte vectors.
+/// No encoding assumption — works with any ASCII-compatible encoding.
+pub fn decode_bytes(input: &[u8]) -> Vec<Vec<Vec<u8>>> {
+    if input.is_empty() {
         return Vec::new();
     }
 
     // For small inputs, use sequential fast path
-    if s.len() < PARALLEL_THRESHOLD {
-        return loads_sequential(s);
+    if input.len() < PARALLEL_THRESHOLD {
+        return decode_bytes_sequential(input);
     }
 
-    loads_parallel(s)
+    decode_bytes_parallel(input)
 }
 
-/// Sequential implementation for small files
-fn loads_sequential(s: &str) -> Vec<Vec<String>> {
+/// Sequential implementation for small inputs (byte-level).
+fn decode_bytes_sequential(input: &[u8]) -> Vec<Vec<Vec<u8>>> {
     let mut data = Vec::new();
-    let mut row = Vec::new();
+    let mut row: Vec<Vec<u8>> = Vec::new();
     let mut start = 0;
 
-    let chars: Vec<char> = s.chars().collect();
-
-    for (pos, &c) in chars.iter().enumerate() {
-        if c == '\n' {
+    for (pos, &b) in input.iter().enumerate() {
+        if b == b'\n' {
             if pos > start {
-                let cell_text: String = chars[start..pos].iter().collect();
-                row.push(unescape(&cell_text));
+                row.push(unescape_bytes(&input[start..pos]));
             } else {
                 data.push(row);
                 row = Vec::new();
@@ -57,9 +71,8 @@ fn loads_sequential(s: &str) -> Vec<Vec<String>> {
         }
     }
 
-    if start < chars.len() {
-        let cell_text: String = chars[start..].iter().collect();
-        row.push(unescape(&cell_text));
+    if start < input.len() {
+        row.push(unescape_bytes(&input[start..]));
     }
 
     if !row.is_empty() {
@@ -69,16 +82,15 @@ fn loads_sequential(s: &str) -> Vec<Vec<String>> {
     data
 }
 
-/// Parallel implementation for large files
-fn loads_parallel(s: &str) -> Vec<Vec<String>> {
+/// Parallel implementation for large inputs (byte-level).
+fn decode_bytes_parallel(input: &[u8]) -> Vec<Vec<Vec<u8>>> {
     // Use fast memchr SIMD scan to find all \n\n boundaries
     // Track which boundaries indicate empty rows during the scan
-    let bytes = s.as_bytes();
     let finder = memmem::Finder::new(b"\n\n");
     let mut boundaries = Vec::new();
     let mut pos = 0;
 
-    while let Some(offset) = finder.find(&bytes[pos..]) {
+    while let Some(offset) = finder.find(&input[pos..]) {
         let abs_pos = pos + offset;
         // abs_pos points to the first \n of \n\n
         // The row ends after both newlines, so boundary is at abs_pos
@@ -87,7 +99,7 @@ fn loads_parallel(s: &str) -> Vec<Vec<String>> {
         // Check for consecutive empty rows: when we have \n\n\n...
         // Each additional \n after the initial \n\n represents another empty row
         let mut check_pos = abs_pos + 2;
-        while check_pos < bytes.len() && bytes[check_pos] == b'\n' {
+        while check_pos < input.len() && input[check_pos] == b'\n' {
             // Found another \n, meaning another \n\n pattern (overlapping)
             boundaries.push(check_pos - 1);
             check_pos += 1;
@@ -99,7 +111,7 @@ fn loads_parallel(s: &str) -> Vec<Vec<String>> {
 
     // Edge case: if no double newlines found, treat as single row
     if boundaries.is_empty() {
-        let row = parse_row(s);
+        let row = parse_row_bytes(input);
         return if row.is_empty() {
             Vec::new()
         } else {
@@ -108,119 +120,163 @@ fn loads_parallel(s: &str) -> Vec<Vec<String>> {
     }
 
     // Build row slices, handling potentially overlapping boundaries from empty rows
-    let mut row_slices = Vec::new();
+    let mut row_slices: Vec<&[u8]> = Vec::new();
     let mut start = 0;
 
     for &boundary in &boundaries {
         // For overlapping boundaries (from empty rows), boundary might be < start
         // In that case, we have an empty row
         if boundary < start {
-            row_slices.push("");
+            row_slices.push(b"");
             // Still need to advance start past this empty row's \n\n
             start = boundary + 2;
         } else {
-            row_slices.push(&s[start..boundary]);
+            row_slices.push(&input[start..boundary]);
             start = boundary + 2;
         }
     }
 
     // Handle remaining data after final "\n\n" boundary (if any)
-    if start < s.len() {
-        row_slices.push(&s[start..]);
+    if start < input.len() {
+        row_slices.push(&input[start..]);
     }
 
     // Parse rows in parallel - fast path, no string contains checks
     row_slices
         .par_iter()
-        .map(|&slice| parse_row(slice))
+        .map(|&slice| parse_row_bytes(slice))
         .collect()
 }
 
-/// Parse a single row from a string slice
-fn parse_row(row_str: &str) -> Vec<String> {
-    if row_str.is_empty() {
+/// Parse a single row from a byte slice.
+fn parse_row_bytes(row: &[u8]) -> Vec<Vec<u8>> {
+    if row.is_empty() {
         return Vec::new();
     }
 
     let mut cells = Vec::new();
     let mut start = 0;
 
-    for (pos, c) in row_str.char_indices() {
-        if c == '\n' {
+    for (pos, &b) in row.iter().enumerate() {
+        if b == b'\n' {
             if pos > start {
-                let cell_text = &row_str[start..pos];
-                cells.push(unescape(cell_text));
+                cells.push(unescape_bytes(&row[start..pos]));
             } else {
                 // Empty cell at position (consecutive newlines within a row shouldn't happen in valid NSV)
-                cells.push(String::new());
+                cells.push(Vec::new());
             }
             start = pos + 1;
         }
     }
 
     // Handle last cell if no trailing newline
-    if start < row_str.len() {
-        let cell_text = &row_str[start..];
-        cells.push(unescape(cell_text));
+    if start < row.len() {
+        cells.push(unescape_bytes(&row[start..]));
     }
 
     cells
 }
 
+/// Unescape a single NSV cell.
 pub fn unescape(s: &str) -> String {
-    if s == "\\" {
-        return String::new();
+    // Safety: splitting on ASCII bytes preserves UTF-8 validity.
+    String::from_utf8(unescape_bytes(s.as_bytes())).unwrap()
+}
+
+/// Unescape a single raw cell (byte-level).
+///
+/// Interprets `\` as the empty cell token (returns empty vec).
+/// `\\` → `\`, `\n` → LF. Unrecognized sequences pass through.
+/// Dangling backslash at end is stripped.
+pub fn unescape_bytes(s: &[u8]) -> Vec<u8> {
+    if s == b"\\" {
+        return Vec::new();
     }
 
-    if !s.contains('\\') {
-        return s.to_string();
+    if !s.contains(&b'\\') {
+        return s.to_vec();
     }
 
-    let mut out = String::new();
+    let mut out = Vec::with_capacity(s.len());
     let mut escaped = false;
 
-    for c in s.chars() {
+    for &b in s {
         if escaped {
-            match c {
-                'n' => out.push('\n'),
-                '\\' => out.push('\\'),
+            match b {
+                b'n' => out.push(b'\n'),
+                b'\\' => out.push(b'\\'),
                 _ => {
-                    out.push('\\');
-                    out.push(c);
+                    out.push(b'\\');
+                    out.push(b);
                 }
             }
             escaped = false;
-        } else if c == '\\' {
+        } else if b == b'\\' {
             escaped = true;
         } else {
-            out.push(c);
+            out.push(b);
         }
     }
 
     out
 }
 
+/// Escape a single NSV cell.
 pub fn escape(s: &str) -> String {
+    // Safety: escape only inserts ASCII bytes (\, n) — preserves UTF-8.
+    String::from_utf8(escape_bytes(s.as_bytes())).unwrap()
+}
+
+/// Escape a single raw cell (byte-level).
+///
+/// Empty input → `\` (empty cell token).
+/// `\` → `\\`, LF → `\n`.
+pub fn escape_bytes(s: &[u8]) -> Vec<u8> {
     if s.is_empty() {
-        return "\\".to_string();
+        return b"\\".to_vec();
     }
 
-    if s.contains('\n') || s.contains('\\') {
-        s.replace('\\', "\\\\").replace('\n', "\\n")
+    if s.contains(&b'\n') || s.contains(&b'\\') {
+        let mut out = Vec::with_capacity(s.len() + s.len() / 4);
+        for &b in s {
+            match b {
+                b'\\' => {
+                    out.push(b'\\');
+                    out.push(b'\\');
+                }
+                b'\n' => {
+                    out.push(b'\\');
+                    out.push(b'n');
+                }
+                _ => out.push(b),
+            }
+        }
+        out
     } else {
-        s.to_string()
+        s.to_vec()
     }
 }
 
-pub fn dumps(data: &[Vec<String>]) -> String {
-    let mut result = String::new();
+/// Encode a seqseq into an NSV string.
+pub fn encode(data: &[Vec<String>]) -> String {
+    let byte_data: Vec<Vec<Vec<u8>>> = data
+        .iter()
+        .map(|row| row.iter().map(|cell| cell.as_bytes().to_vec()).collect())
+        .collect();
+    // Safety: encoding only inserts ASCII bytes — preserves UTF-8.
+    String::from_utf8(encode_bytes(&byte_data)).unwrap()
+}
+
+/// Encode a seqseq of byte vectors into raw NSV bytes.
+pub fn encode_bytes(data: &[Vec<Vec<u8>>]) -> Vec<u8> {
+    let mut result = Vec::new();
 
     for row in data {
         for cell in row {
-            result.push_str(&escape(cell));
-            result.push('\n');
+            result.extend_from_slice(&escape_bytes(cell));
+            result.push(b'\n');
         }
-        result.push('\n');
+        result.push(b'\n');
     }
 
     result
@@ -316,7 +372,7 @@ mod tests {
     #[test]
     fn test_simple_table() {
         let nsv = "col1\ncol2\n\na\nb\n\nc\nd\n";
-        let result = loads(nsv);
+        let result = decode(nsv);
         assert_eq!(
             result,
             vec![
@@ -330,7 +386,7 @@ mod tests {
     #[test]
     fn test_empty_fields() {
         let nsv = "a\n\\\nb\n\n\\\nc\n\\\n";
-        let result = loads(nsv);
+        let result = decode(nsv);
         assert_eq!(
             result,
             vec![
@@ -343,7 +399,7 @@ mod tests {
     #[test]
     fn test_escape_sequences() {
         let nsv = "Line 1\\nLine 2\nBackslash: \\\\\nNot a newline: \\\\n\n";
-        let result = loads(nsv);
+        let result = decode(nsv);
         assert_eq!(
             result,
             vec![vec![
@@ -357,7 +413,7 @@ mod tests {
     #[test]
     fn test_empty_rows() {
         let nsv = "first\n\n\n\nsecond\n";
-        let result = loads(nsv);
+        let result = decode(nsv);
         assert_eq!(
             result,
             vec![
@@ -372,7 +428,7 @@ mod tests {
     #[test]
     fn test_multiple_empty_rows() {
         let nsv = "a\n\n\n\n\nb\n";
-        let result = loads(nsv);
+        let result = decode(nsv);
         assert_eq!(
             result,
             vec![
@@ -394,42 +450,42 @@ mod tests {
             vec!["multi\nline".to_string(), "normal".to_string()],
         ];
 
-        let encoded = dumps(&original);
-        let decoded = loads(&encoded);
+        let encoded = encode(&original);
+        let decoded = decode(&encoded);
         assert_eq!(original, decoded);
     }
 
     #[test]
     fn test_unrecognized_escape() {
         let nsv = "\\x41\\t\\r\n";
-        let result = loads(nsv);
+        let result = decode(nsv);
         assert_eq!(result, vec![vec!["\\x41\\t\\r".to_string()],]);
     }
 
     #[test]
     fn test_dangling_backslash() {
         let nsv = "text\\\n";
-        let result = loads(nsv);
+        let result = decode(nsv);
         assert_eq!(result, vec![vec!["text".to_string()],]);
     }
 
     #[test]
     fn test_empty_input() {
-        let result = loads("");
+        let result = decode("");
         assert_eq!(result, Vec::<Vec<String>>::new());
     }
 
     #[test]
     fn test_no_trailing_newline() {
         let nsv = "a\nb";
-        let result = loads(nsv);
+        let result = decode(nsv);
         assert_eq!(result, vec![vec!["a".to_string(), "b".to_string()],]);
     }
 
     #[test]
     fn test_only_empty_rows() {
         let nsv = "\n\n\n\n";
-        let result = loads(nsv);
+        let result = decode(nsv);
         assert_eq!(
             result,
             vec![
@@ -444,7 +500,7 @@ mod tests {
     #[test]
     fn test_starts_with_empty_row() {
         let nsv = "\n\nfirst\n";
-        let result = loads(nsv);
+        let result = decode(nsv);
         assert_eq!(
             result,
             vec![
@@ -463,12 +519,12 @@ mod tests {
             .map(|i| vec![format!("row{}", i), format!("data{}", i)])
             .collect();
 
-        let encoded = dumps(&large_data);
+        let encoded = encode(&large_data);
 
         // Verify it's large enough to trigger parallel parsing
         assert!(encoded.len() > PARALLEL_THRESHOLD);
 
-        let decoded = loads(&encoded);
+        let decoded = decode(&encoded);
         assert_eq!(large_data, decoded);
     }
 
@@ -487,10 +543,10 @@ mod tests {
             }
         }
 
-        let encoded = dumps(&data);
+        let encoded = encode(&data);
         assert!(encoded.len() > PARALLEL_THRESHOLD);
 
-        let decoded = loads(&encoded);
+        let decoded = decode(&encoded);
         assert_eq!(data, decoded);
     }
 
@@ -507,11 +563,114 @@ mod tests {
             ]);
         }
 
-        let encoded = dumps(&data);
+        let encoded = encode(&data);
         assert!(encoded.len() > PARALLEL_THRESHOLD);
 
-        let decoded = loads(&encoded);
+        let decoded = decode(&encoded);
         assert_eq!(data, decoded);
+    }
+
+    // ── Byte-level tests ──
+
+    #[test]
+    fn test_bytes_roundtrip() {
+        let original: Vec<Vec<Vec<u8>>> = vec![
+            vec![b"col1".to_vec(), b"col2".to_vec()],
+            vec![b"a".to_vec(), b"b".to_vec()],
+            vec![b"".to_vec(), b"value\\with\\backslash".as_slice().to_vec()],
+            vec![b"multi\nline".to_vec(), b"normal".to_vec()],
+        ];
+
+        let encoded = encode_bytes(&original);
+        let decoded = decode_bytes(&encoded);
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_bytes_non_utf8() {
+        // Latin-1 bytes with values > 0x7F — not valid UTF-8
+        let cell1: Vec<u8> = vec![0xC0, 0xE9, 0xF1]; // àéñ in Latin-1
+        let cell2: Vec<u8> = vec![0xFF, 0xFE, 0x80]; // arbitrary high bytes
+        let original: Vec<Vec<Vec<u8>>> = vec![vec![cell1.clone(), cell2.clone()]];
+
+        let encoded = encode_bytes(&original);
+        let decoded = decode_bytes(&encoded);
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_bytes_empty_cells_and_rows() {
+        let original: Vec<Vec<Vec<u8>>> = vec![
+            vec![b"a".to_vec(), b"".to_vec(), b"b".to_vec()],
+            vec![],
+            vec![b"".to_vec()],
+        ];
+
+        let encoded = encode_bytes(&original);
+        let decoded = decode_bytes(&encoded);
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_bytes_with_special_ascii_bytes() {
+        // Verify that only 0x0A (LF), 0x5C (\), 0x6E (n) are structurally significant
+        let cell: Vec<u8> = (0u8..=255)
+            .filter(|&b| b != b'\n' && b != b'\\')
+            .collect();
+        let original = vec![vec![cell.clone()]];
+
+        let encoded = encode_bytes(&original);
+        let decoded = decode_bytes(&encoded);
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_decode_bytes_matches_decode_str() {
+        // Confirm decode(s) and decode_bytes(s.as_bytes()) produce equivalent structures
+        let inputs = vec![
+            "col1\ncol2\n\na\nb\n\nc\nd\n",
+            "a\n\\\nb\n\n\\\nc\n\\\n",
+            "Line 1\\nLine 2\nBackslash: \\\\\n",
+            "first\n\n\n\nsecond\n",
+            "",
+            "\n\n\n\n",
+        ];
+
+        for input in inputs {
+            let str_result = decode(input);
+            let byte_result = decode_bytes(input.as_bytes());
+
+            // Convert byte result to strings for comparison
+            let byte_as_str: Vec<Vec<String>> = byte_result
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|cell| String::from_utf8(cell).unwrap())
+                        .collect()
+                })
+                .collect();
+
+            assert_eq!(str_result, byte_as_str, "mismatch for input: {:?}", input);
+        }
+    }
+
+    #[test]
+    fn test_bytes_large_parallel() {
+        // Generate enough data to trigger parallel path
+        let large_data: Vec<Vec<Vec<u8>>> = (0..100_000)
+            .map(|i| {
+                vec![
+                    format!("row{}", i).into_bytes(),
+                    format!("data{}", i).into_bytes(),
+                ]
+            })
+            .collect();
+
+        let encoded = encode_bytes(&large_data);
+        assert!(encoded.len() > PARALLEL_THRESHOLD);
+
+        let decoded = decode_bytes(&encoded);
+        assert_eq!(large_data, decoded);
     }
 
     // ── check() tests ──
