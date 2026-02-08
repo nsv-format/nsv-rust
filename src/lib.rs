@@ -237,8 +237,8 @@ pub struct Warning {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WarningKind {
-    /// `\` followed by a char other than `n` or `\`
-    UnknownEscape(char),
+    /// `\` followed by a byte other than `n` or `\`
+    UnknownEscape(u8),
     /// `\` immediately before LF or at EOF
     DanglingBackslash,
     /// Non-empty input not ending with LF
@@ -285,15 +285,14 @@ pub fn check(s: &str) -> Vec<Warning> {
                             });
                             i += 1;
                         }
-                        _ => {
-                            let next_char = s[i + 1..].chars().next().unwrap();
+                        b => {
                             warnings.push(Warning {
-                                kind: WarningKind::UnknownEscape(next_char),
+                                kind: WarningKind::UnknownEscape(b),
                                 pos: i,
                                 line,
                                 col,
                             });
-                            i += 1 + next_char.len_utf8();
+                            i += 2;
                         }
                     }
                 }
@@ -550,7 +549,7 @@ mod tests {
         assert_eq!(
             warnings,
             vec![Warning {
-                kind: WarningKind::UnknownEscape('t'),
+                kind: WarningKind::UnknownEscape(b't'),
                 pos: 5,
                 line: 1,
                 col: 6,
@@ -565,13 +564,13 @@ mod tests {
             warnings,
             vec![
                 Warning {
-                    kind: WarningKind::UnknownEscape('t'),
+                    kind: WarningKind::UnknownEscape(b't'),
                     pos: 0,
                     line: 1,
                     col: 1,
                 },
                 Warning {
-                    kind: WarningKind::UnknownEscape('r'),
+                    kind: WarningKind::UnknownEscape(b'r'),
                     pos: 8,
                     line: 2,
                     col: 1,
@@ -638,7 +637,7 @@ mod tests {
             warnings,
             vec![
                 Warning {
-                    kind: WarningKind::UnknownEscape('t'),
+                    kind: WarningKind::UnknownEscape(b't'),
                     pos: 0,
                     line: 1,
                     col: 1,
