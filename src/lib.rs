@@ -313,19 +313,18 @@ pub enum WarningKind {
 ///
 /// Warns on unknown escape sequences, dangling backslashes, and missing terminal LF.
 /// Positions are byte offsets; line and col are 1-indexed.
-pub fn check(s: &str) -> Vec<Warning> {
-    if s.is_empty() {
+pub fn check(input: &[u8]) -> Vec<Warning> {
+    if input.is_empty() {
         return Vec::new();
     }
 
     let mut warnings = Vec::new();
-    let bytes = s.as_bytes();
-    let len = bytes.len();
+    let len = input.len();
     let mut line: usize = 1;
     let mut line_start: usize = 0;
     let mut escaped = false;
 
-    for (i, &b) in bytes.iter().enumerate() {
+    for (i, &b) in input.iter().enumerate() {
         if escaped {
             match b {
                 b'n' | b'\\' => {}
@@ -685,23 +684,23 @@ mod tests {
 
     #[test]
     fn test_check_empty_input() {
-        assert_eq!(check(""), vec![]);
+        assert_eq!(check(b""), vec![]);
     }
 
     #[test]
     fn test_check_just_lf() {
-        assert_eq!(check("\n"), vec![]);
+        assert_eq!(check(b"\n"), vec![]);
     }
 
     #[test]
     fn test_check_no_issues() {
-        assert_eq!(check("col1\ncol2\n\na\nb\n\n"), vec![]);
-        assert_eq!(check("hello\\\\world\n\\n\n\n"), vec![]);
+        assert_eq!(check(b"col1\ncol2\n\na\nb\n\n"), vec![]);
+        assert_eq!(check(b"hello\\\\world\n\\n\n\n"), vec![]);
     }
 
     #[test]
     fn test_check_single_unknown_escape() {
-        let warnings = check("hello\\tworld\n");
+        let warnings = check(b"hello\\tworld\n");
         assert_eq!(
             warnings,
             vec![Warning {
@@ -715,7 +714,7 @@ mod tests {
 
     #[test]
     fn test_check_multiple_unknown_escapes_different_lines() {
-        let warnings = check("\\thello\n\\rworld\n\n");
+        let warnings = check(b"\\thello\n\\rworld\n\n");
         assert_eq!(
             warnings,
             vec![
@@ -737,7 +736,7 @@ mod tests {
 
     #[test]
     fn test_check_dangling_backslash_mid_file() {
-        let warnings = check("text\\\nmore\n\n");
+        let warnings = check(b"text\\\nmore\n\n");
         assert_eq!(
             warnings,
             vec![Warning {
@@ -751,7 +750,7 @@ mod tests {
 
     #[test]
     fn test_check_dangling_backslash_at_eof() {
-        let warnings = check("text\\");
+        let warnings = check(b"text\\");
         assert_eq!(
             warnings,
             vec![
@@ -773,7 +772,7 @@ mod tests {
 
     #[test]
     fn test_check_no_terminal_lf() {
-        let warnings = check("hello");
+        let warnings = check(b"hello");
         assert_eq!(
             warnings,
             vec![Warning {
@@ -788,7 +787,7 @@ mod tests {
     #[test]
     fn test_check_combination() {
         // \(0) t(1) h(2) e(3) l(4) l(5) o(6) \(7) LF(8) w(9) o(10) r(11) l(12) d(13)
-        let warnings = check("\\thello\\\nworld");
+        let warnings = check(b"\\thello\\\nworld");
         assert_eq!(
             warnings,
             vec![
@@ -811,6 +810,22 @@ mod tests {
                     col: 6,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn test_check_non_utf8() {
+        // Non-UTF-8 bytes with a bad escape: 0xFF 0xFE \t 0x80 LF
+        let input: &[u8] = &[0xFF, 0xFE, b'\\', b't', 0x80, b'\n'];
+        let warnings = check(input);
+        assert_eq!(
+            warnings,
+            vec![Warning {
+                kind: WarningKind::UnknownEscape(b't'),
+                pos: 2,
+                line: 1,
+                col: 3,
+            }]
         );
     }
 }
