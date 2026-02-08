@@ -297,7 +297,7 @@ pub fn check(s: &str) -> Vec<Warning> {
         });
     }
 
-    if bytes[len - 1] != b'\n' {
+    if line_start != len {
         warnings.push(Warning {
             kind: WarningKind::NoTerminalLf,
             pos: len,
