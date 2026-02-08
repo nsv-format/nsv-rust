@@ -1,6 +1,6 @@
 [package]
 name = "nsv"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2021"
 description = "NSV (Newline-Separated Values) format parser and encoder"
 license = "MIT"
