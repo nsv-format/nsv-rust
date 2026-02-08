@@ -30,8 +30,10 @@ pub fn decode(s: &str) -> Vec<Vec<String>> {
         .map(|row| {
             row.into_iter()
                 .map(|cell| {
-                    // Safety: splitting/unescaping on ASCII bytes preserves UTF-8 validity.
-                    String::from_utf8(cell).unwrap()
+                    // SAFETY: input was &str (valid UTF-8). NSV splitting and unescaping
+                    // only operate on ASCII bytes (0x0A, 0x5C, 0x6E), which cannot split
+                    // a multi-byte UTF-8 sequence. Each resulting cell is therefore valid UTF-8.
+                    unsafe { String::from_utf8_unchecked(cell) }
                 })
                 .collect()
         })
@@ -179,8 +181,8 @@ fn parse_row_bytes(row: &[u8]) -> Vec<Vec<u8>> {
 
 /// Unescape a single NSV cell.
 pub fn unescape(s: &str) -> String {
-    // Safety: splitting on ASCII bytes preserves UTF-8 validity.
-    String::from_utf8(unescape_bytes(s.as_bytes())).unwrap()
+    // SAFETY: unescape only removes/replaces ASCII bytes — preserves UTF-8 validity.
+    unsafe { String::from_utf8_unchecked(unescape_bytes(s.as_bytes())) }
 }
 
 /// Unescape a single raw cell (byte-level).
@@ -223,8 +225,8 @@ pub fn unescape_bytes(s: &[u8]) -> Vec<u8> {
 
 /// Escape a single NSV cell.
 pub fn escape(s: &str) -> String {
-    // Safety: escape only inserts ASCII bytes (\, n) — preserves UTF-8.
-    String::from_utf8(escape_bytes(s.as_bytes())).unwrap()
+    // SAFETY: escape only inserts ASCII bytes (\, n) — preserves UTF-8 validity.
+    unsafe { String::from_utf8_unchecked(escape_bytes(s.as_bytes())) }
 }
 
 /// Escape a single raw cell (byte-level).
@@ -259,12 +261,18 @@ pub fn escape_bytes(s: &[u8]) -> Vec<u8> {
 
 /// Encode a seqseq into an NSV string.
 pub fn encode(data: &[Vec<String>]) -> String {
-    let byte_data: Vec<Vec<Vec<u8>>> = data
-        .iter()
-        .map(|row| row.iter().map(|cell| cell.as_bytes().to_vec()).collect())
-        .collect();
-    // Safety: encoding only inserts ASCII bytes — preserves UTF-8.
-    String::from_utf8(encode_bytes(&byte_data)).unwrap()
+    let mut result = Vec::new();
+
+    for row in data {
+        for cell in row {
+            result.extend_from_slice(&escape_bytes(cell.as_bytes()));
+            result.push(b'\n');
+        }
+        result.push(b'\n');
+    }
+
+    // Safety: encoding only inserts ASCII bytes (\, n, LF) — preserves UTF-8.
+    String::from_utf8(result).unwrap()
 }
 
 /// Encode a seqseq of byte vectors into raw NSV bytes.
