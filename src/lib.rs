@@ -272,10 +272,9 @@ pub fn check(s: &str) -> Vec<Warning> {
                         line,
                         col,
                     });
-                    i += 1;
                 } else {
                     match bytes[i + 1] {
-                        b'n' | b'\\' => i += 2,
+                        b'n' | b'\\' => i += 1,
                         b'\n' => {
                             warnings.push(Warning {
                                 kind: WarningKind::DanglingBackslash,
@@ -283,7 +282,6 @@ pub fn check(s: &str) -> Vec<Warning> {
                                 line,
                                 col,
                             });
-                            i += 1;
                         }
                         b => {
                             warnings.push(Warning {
@@ -292,7 +290,7 @@ pub fn check(s: &str) -> Vec<Warning> {
                                 line,
                                 col,
                             });
-                            i += 2;
+                            i += 1;
                         }
                     }
                 }
@@ -300,12 +298,10 @@ pub fn check(s: &str) -> Vec<Warning> {
             b'\n' => {
                 line += 1;
                 line_start = i + 1;
-                i += 1;
             }
-            _ => {
-                i += 1;
-            }
+            _ => {}
         }
+        i += 1;
     }
 
     if bytes[len - 1] != b'\n' {
