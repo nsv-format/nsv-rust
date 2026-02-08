@@ -226,6 +226,89 @@ pub fn dumps(data: &[Vec<String>]) -> String {
     result
 }
 
+/// A single warning found during validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Warning {
+    pub kind: WarningKind,
+    pub pos: usize,
+    pub line: usize,
+    pub col: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WarningKind {
+    /// `\` followed by a byte other than `n` or `\`
+    UnknownEscape(u8),
+    /// `\` immediately before LF or at EOF
+    DanglingBackslash,
+    /// Non-empty input not ending with LF
+    NoTerminalLf,
+}
+
+/// Report edge cases in raw NSV input without altering parsing behavior.
+///
+/// Warns on unknown escape sequences, dangling backslashes, and missing terminal LF.
+/// Positions are byte offsets; line and col are 1-indexed.
+pub fn check(s: &str) -> Vec<Warning> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+
+    let mut warnings = Vec::new();
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut line: usize = 1;
+    let mut line_start: usize = 0;
+    let mut escaped = false;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if escaped {
+            match b {
+                b'n' | b'\\' => {}
+                b'\n' => warnings.push(Warning {
+                    kind: WarningKind::DanglingBackslash,
+                    pos: i - 1,
+                    line,
+                    col: i - line_start,
+                }),
+                _ => warnings.push(Warning {
+                    kind: WarningKind::UnknownEscape(b),
+                    pos: i - 1,
+                    line,
+                    col: i - line_start,
+                }),
+            }
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+        }
+        if b == b'\n' {
+            line += 1;
+            line_start = i + 1;
+        }
+    }
+
+    if escaped {
+        warnings.push(Warning {
+            kind: WarningKind::DanglingBackslash,
+            pos: len - 1,
+            line,
+            col: len - line_start,
+        });
+    }
+
+    if line_start != len {
+        warnings.push(Warning {
+            kind: WarningKind::NoTerminalLf,
+            pos: len,
+            line,
+            col: len - line_start + 1,
+        });
+    }
+
+    warnings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,5 +512,138 @@ mod tests {
 
         let decoded = loads(&encoded);
         assert_eq!(data, decoded);
+    }
+
+    // ── check() tests ──
+
+    #[test]
+    fn test_check_empty_input() {
+        assert_eq!(check(""), vec![]);
+    }
+
+    #[test]
+    fn test_check_just_lf() {
+        assert_eq!(check("\n"), vec![]);
+    }
+
+    #[test]
+    fn test_check_no_issues() {
+        assert_eq!(check("col1\ncol2\n\na\nb\n\n"), vec![]);
+        assert_eq!(check("hello\\\\world\n\\n\n\n"), vec![]);
+    }
+
+    #[test]
+    fn test_check_single_unknown_escape() {
+        let warnings = check("hello\\tworld\n");
+        assert_eq!(
+            warnings,
+            vec![Warning {
+                kind: WarningKind::UnknownEscape(b't'),
+                pos: 5,
+                line: 1,
+                col: 6,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_check_multiple_unknown_escapes_different_lines() {
+        let warnings = check("\\thello\n\\rworld\n\n");
+        assert_eq!(
+            warnings,
+            vec![
+                Warning {
+                    kind: WarningKind::UnknownEscape(b't'),
+                    pos: 0,
+                    line: 1,
+                    col: 1,
+                },
+                Warning {
+                    kind: WarningKind::UnknownEscape(b'r'),
+                    pos: 8,
+                    line: 2,
+                    col: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_check_dangling_backslash_mid_file() {
+        let warnings = check("text\\\nmore\n\n");
+        assert_eq!(
+            warnings,
+            vec![Warning {
+                kind: WarningKind::DanglingBackslash,
+                pos: 4,
+                line: 1,
+                col: 5,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_check_dangling_backslash_at_eof() {
+        let warnings = check("text\\");
+        assert_eq!(
+            warnings,
+            vec![
+                Warning {
+                    kind: WarningKind::DanglingBackslash,
+                    pos: 4,
+                    line: 1,
+                    col: 5,
+                },
+                Warning {
+                    kind: WarningKind::NoTerminalLf,
+                    pos: 5,
+                    line: 1,
+                    col: 6,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_check_no_terminal_lf() {
+        let warnings = check("hello");
+        assert_eq!(
+            warnings,
+            vec![Warning {
+                kind: WarningKind::NoTerminalLf,
+                pos: 5,
+                line: 1,
+                col: 6,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_check_combination() {
+        // \(0) t(1) h(2) e(3) l(4) l(5) o(6) \(7) LF(8) w(9) o(10) r(11) l(12) d(13)
+        let warnings = check("\\thello\\\nworld");
+        assert_eq!(
+            warnings,
+            vec![
+                Warning {
+                    kind: WarningKind::UnknownEscape(b't'),
+                    pos: 0,
+                    line: 1,
+                    col: 1,
+                },
+                Warning {
+                    kind: WarningKind::DanglingBackslash,
+                    pos: 7,
+                    line: 1,
+                    col: 8,
+                },
+                Warning {
+                    kind: WarningKind::NoTerminalLf,
+                    pos: 14,
+                    line: 2,
+                    col: 6,
+                },
+            ]
+        );
     }
 }
