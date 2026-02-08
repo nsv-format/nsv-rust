@@ -226,6 +226,113 @@ pub fn dumps(data: &[Vec<String>]) -> String {
     result
 }
 
+/// A single warning found during validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Warning {
+    pub kind: WarningKind,
+    /// Byte offset in the input
+    pub pos: usize,
+    /// 1-indexed line number
+    pub line: usize,
+    /// 1-indexed column (byte offset within line)
+    pub col: usize,
+}
+
+/// The kind of warning detected by [`check`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WarningKind {
+    /// `\x`, `\t`, `\r`, etc. — any `\` followed by a char that isn't `n` or `\`
+    UnknownEscape(char),
+    /// `\` as the very last character of a line (before `\n` or EOF)
+    DanglingBackslash,
+    /// Input is non-empty but doesn't end with `\n`
+    NoTerminalNewline,
+}
+
+/// Validate raw NSV input and report edge cases without altering parsing behavior.
+///
+/// `loads()` stays lenient and unchanged; `check()` is the opt-in strictness layer.
+/// It detects unknown escape sequences, dangling backslashes, and missing terminal newlines.
+pub fn check(s: &str) -> Vec<Warning> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+
+    let mut warnings = Vec::new();
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut line: usize = 1;
+    let mut line_start: usize = 0;
+
+    while i < len {
+        match bytes[i] {
+            b'\\' => {
+                let col = i - line_start + 1;
+                if i + 1 >= len {
+                    // Backslash at EOF
+                    warnings.push(Warning {
+                        kind: WarningKind::DanglingBackslash,
+                        pos: i,
+                        line,
+                        col,
+                    });
+                    i += 1;
+                } else {
+                    match bytes[i + 1] {
+                        b'n' | b'\\' => {
+                            // Valid escape sequence (\n or \\)
+                            i += 2;
+                        }
+                        b'\n' => {
+                            // Backslash immediately before newline
+                            warnings.push(Warning {
+                                kind: WarningKind::DanglingBackslash,
+                                pos: i,
+                                line,
+                                col,
+                            });
+                            // Let the next iteration handle the newline
+                            i += 1;
+                        }
+                        _ => {
+                            // Unknown escape — decode the char after the backslash
+                            let next_char = s[i + 1..].chars().next().unwrap();
+                            warnings.push(Warning {
+                                kind: WarningKind::UnknownEscape(next_char),
+                                pos: i,
+                                line,
+                                col,
+                            });
+                            i += 1 + next_char.len_utf8();
+                        }
+                    }
+                }
+            }
+            b'\n' => {
+                line += 1;
+                line_start = i + 1;
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    // Check for missing terminal newline
+    if bytes[len - 1] != b'\n' {
+        warnings.push(Warning {
+            kind: WarningKind::NoTerminalNewline,
+            pos: len,
+            line,
+            col: len - line_start + 1,
+        });
+    }
+
+    warnings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,5 +536,145 @@ mod tests {
 
         let decoded = loads(&encoded);
         assert_eq!(data, decoded);
+    }
+
+    // ── check() tests ──
+
+    #[test]
+    fn test_check_empty_input() {
+        assert_eq!(check(""), vec![]);
+    }
+
+    #[test]
+    fn test_check_just_newline() {
+        assert_eq!(check("\n"), vec![]);
+    }
+
+    #[test]
+    fn test_check_no_issues() {
+        // Basic valid NSV — no escapes, properly terminated
+        assert_eq!(check("col1\ncol2\n\na\nb\n\n"), vec![]);
+        // Valid with escape sequences (\\  and \n)
+        assert_eq!(check("hello\\\\world\n\\n\n\n"), vec![]);
+    }
+
+    #[test]
+    fn test_check_single_unknown_escape() {
+        // "hello\tworld\n" — \t at byte offset 5
+        let warnings = check("hello\\tworld\n");
+        assert_eq!(
+            warnings,
+            vec![Warning {
+                kind: WarningKind::UnknownEscape('t'),
+                pos: 5,
+                line: 1,
+                col: 6,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_check_multiple_unknown_escapes_different_lines() {
+        // Line 1: \t at pos 0; Line 2: \r at pos 8
+        let warnings = check("\\thello\n\\rworld\n\n");
+        assert_eq!(
+            warnings,
+            vec![
+                Warning {
+                    kind: WarningKind::UnknownEscape('t'),
+                    pos: 0,
+                    line: 1,
+                    col: 1,
+                },
+                Warning {
+                    kind: WarningKind::UnknownEscape('r'),
+                    pos: 8,
+                    line: 2,
+                    col: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_check_dangling_backslash_mid_file() {
+        // Backslash immediately before \n on line 1
+        let warnings = check("text\\\nmore\n\n");
+        assert_eq!(
+            warnings,
+            vec![Warning {
+                kind: WarningKind::DanglingBackslash,
+                pos: 4,
+                line: 1,
+                col: 5,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_check_dangling_backslash_at_eof() {
+        // Backslash as last byte — both dangling and no terminal newline
+        let warnings = check("text\\");
+        assert_eq!(
+            warnings,
+            vec![
+                Warning {
+                    kind: WarningKind::DanglingBackslash,
+                    pos: 4,
+                    line: 1,
+                    col: 5,
+                },
+                Warning {
+                    kind: WarningKind::NoTerminalNewline,
+                    pos: 5,
+                    line: 1,
+                    col: 6,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_check_no_terminal_newline() {
+        let warnings = check("hello");
+        assert_eq!(
+            warnings,
+            vec![Warning {
+                kind: WarningKind::NoTerminalNewline,
+                pos: 5,
+                line: 1,
+                col: 6,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_check_combination() {
+        // \t unknown escape, dangling backslash before \n, then no terminal newline
+        // bytes: \(0) t(1) h(2) e(3) l(4) l(5) o(6) \(7) LF(8) w(9) o(10) r(11) l(12) d(13)
+        let warnings = check("\\thello\\\nworld");
+        assert_eq!(
+            warnings,
+            vec![
+                Warning {
+                    kind: WarningKind::UnknownEscape('t'),
+                    pos: 0,
+                    line: 1,
+                    col: 1,
+                },
+                Warning {
+                    kind: WarningKind::DanglingBackslash,
+                    pos: 7,
+                    line: 1,
+                    col: 8,
+                },
+                Warning {
+                    kind: WarningKind::NoTerminalNewline,
+                    pos: 14,
+                    line: 2,
+                    col: 6,
+                },
+            ]
+        );
     }
 }
