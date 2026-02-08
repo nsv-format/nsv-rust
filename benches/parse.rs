@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use nsv::{dumps, loads};
+use nsv::{encode, decode};
 
 fn generate_test_data(rows: usize, cells_per_row: usize) -> Vec<Vec<String>> {
     (0..rows)
@@ -13,37 +13,37 @@ fn generate_test_data(rows: usize, cells_per_row: usize) -> Vec<Vec<String>> {
 
 fn bench_loads_small(c: &mut Criterion) {
     let data = generate_test_data(100, 10);
-    let nsv = dumps(&data);
+    let nsv = encode(&data);
 
     c.bench_function("loads_100_rows", |b| {
-        b.iter(|| loads(black_box(&nsv)))
+        b.iter(|| decode(black_box(&nsv)))
     });
 }
 
 fn bench_loads_medium(c: &mut Criterion) {
     let data = generate_test_data(1_000, 10);
-    let nsv = dumps(&data);
+    let nsv = encode(&data);
 
     c.bench_function("loads_1k_rows", |b| {
-        b.iter(|| loads(black_box(&nsv)))
+        b.iter(|| decode(black_box(&nsv)))
     });
 }
 
 fn bench_loads_large(c: &mut Criterion) {
     let data = generate_test_data(10_000, 10);
-    let nsv = dumps(&data);
+    let nsv = encode(&data);
 
     c.bench_function("loads_10k_rows", |b| {
-        b.iter(|| loads(black_box(&nsv)))
+        b.iter(|| decode(black_box(&nsv)))
     });
 }
 
 fn bench_loads_xlarge(c: &mut Criterion) {
     let data = generate_test_data(100_000, 10);
-    let nsv = dumps(&data);
+    let nsv = encode(&data);
 
     c.bench_function("loads_100k_rows", |b| {
-        b.iter(|| loads(black_box(&nsv)))
+        b.iter(|| decode(black_box(&nsv)))
     });
 }
 
@@ -52,21 +52,21 @@ fn bench_loads_various_sizes(c: &mut Criterion) {
 
     for size in [100, 500, 1_000, 5_000, 10_000, 50_000].iter() {
         let data = generate_test_data(*size, 10);
-        let nsv = dumps(&data);
+        let nsv = encode(&data);
 
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, _| {
-            b.iter(|| loads(black_box(&nsv)))
+            b.iter(|| decode(black_box(&nsv)))
         });
     }
 
     group.finish();
 }
 
-fn bench_dumps(c: &mut Criterion) {
+fn bench_encode(c: &mut Criterion) {
     let data = generate_test_data(10_000, 10);
 
     c.bench_function("dumps_10k_rows", |b| {
-        b.iter(|| dumps(black_box(&data)))
+        b.iter(|| encode(black_box(&data)))
     });
 }
 
@@ -77,6 +77,6 @@ criterion_group!(
     bench_loads_large,
     bench_loads_xlarge,
     bench_loads_various_sizes,
-    bench_dumps
+    bench_encode
 );
 criterion_main!(benches);
