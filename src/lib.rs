@@ -257,51 +257,44 @@ pub fn check(s: &str) -> Vec<Warning> {
     let mut warnings = Vec::new();
     let bytes = s.as_bytes();
     let len = bytes.len();
-    let mut i = 0;
     let mut line: usize = 1;
     let mut line_start: usize = 0;
+    let mut escaped = false;
 
-    while i < len {
-        match bytes[i] {
-            b'\\' => {
-                let col = i - line_start + 1;
-                if i + 1 >= len {
-                    warnings.push(Warning {
-                        kind: WarningKind::DanglingBackslash,
-                        pos: i,
-                        line,
-                        col,
-                    });
-                } else {
-                    match bytes[i + 1] {
-                        b'n' | b'\\' => i += 1,
-                        b'\n' => {
-                            warnings.push(Warning {
-                                kind: WarningKind::DanglingBackslash,
-                                pos: i,
-                                line,
-                                col,
-                            });
-                        }
-                        b => {
-                            warnings.push(Warning {
-                                kind: WarningKind::UnknownEscape(b),
-                                pos: i,
-                                line,
-                                col,
-                            });
-                            i += 1;
-                        }
-                    }
-                }
+    for (i, &b) in bytes.iter().enumerate() {
+        if escaped {
+            match b {
+                b'n' | b'\\' => {}
+                b'\n' => warnings.push(Warning {
+                    kind: WarningKind::DanglingBackslash,
+                    pos: i - 1,
+                    line,
+                    col: i - line_start,
+                }),
+                _ => warnings.push(Warning {
+                    kind: WarningKind::UnknownEscape(b),
+                    pos: i - 1,
+                    line,
+                    col: i - line_start,
+                }),
             }
-            b'\n' => {
-                line += 1;
-                line_start = i + 1;
-            }
-            _ => {}
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
         }
-        i += 1;
+        if b == b'\n' {
+            line += 1;
+            line_start = i + 1;
+        }
+    }
+
+    if escaped {
+        warnings.push(Warning {
+            kind: WarningKind::DanglingBackslash,
+            pos: len - 1,
+            line,
+            col: len - line_start,
+        });
     }
 
     if bytes[len - 1] != b'\n' {
