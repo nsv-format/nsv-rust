@@ -5,11 +5,14 @@
 //!
 //! ## Parallel Parsing Strategy
 //!
-//! For files larger than 64KB, we use a parallel approach:
-//! 1. Find all row boundaries (positions of `\n\n`) using memchr's SIMD-optimized search
-//! 2. Split the input into row slices
-//! 3. Parse each row in parallel using rayon
-//! 4. Each row is split on `\n` and cells are unescaped
+//! For files larger than 64KB, we use a chunked parallel approach:
+//! 1. Pick N evenly-spaced byte positions (one per CPU core)
+//! 2. For each, scan forward to the nearest `\n\n` row boundary — O(avg_row_len)
+//! 3. Each worker independently parses its chunk (boundary scan + cell split + unescape)
+//!
+//! This works because literal `0x0A` bytes in NSV are always structural (never escaped),
+//! so row alignment recovery from any byte position is a trivial forward scan.
+//! The sequential phase is O(N), not O(input_len) — all real work is parallel.
 //!
 //! For smaller files, we use a sequential fast path to avoid thread overhead.
 
@@ -84,99 +87,56 @@ fn decode_bytes_sequential(input: &[u8]) -> Vec<Vec<Vec<u8>>> {
     data
 }
 
-/// Parallel implementation for large inputs (byte-level).
+/// Chunked parallel implementation for large inputs (byte-level).
+///
+/// Splits the input into N equal-sized byte chunks (one per core), aligns each
+/// split point to the nearest `\n\n` row boundary, and parses each chunk
+/// independently. The sequential phase is O(N), not O(input_len).
 fn decode_bytes_parallel(input: &[u8]) -> Vec<Vec<Vec<u8>>> {
-    // Use fast memchr SIMD scan to find all \n\n boundaries
-    // Track which boundaries indicate empty rows during the scan
+    let num_threads = rayon::current_num_threads();
+    let chunk_size = input.len() / num_threads;
+
+    if chunk_size == 0 {
+        return decode_bytes_sequential(input);
+    }
+
+    // Find N-1 split points at \n\n boundaries near evenly-spaced positions.
+    // Cost: O(N * avg_row_len) — negligible compared to input size.
     let finder = memmem::Finder::new(b"\n\n");
-    let mut boundaries = Vec::new();
-    let mut pos = 0;
+    let mut splits = Vec::with_capacity(num_threads + 1);
+    splits.push(0usize);
 
-    while let Some(offset) = finder.find(&input[pos..]) {
-        let abs_pos = pos + offset;
-        // abs_pos points to the first \n of \n\n
-        // The row ends after both newlines, so boundary is at abs_pos
-        boundaries.push(abs_pos);
-
-        // Check for consecutive empty rows: when we have \n\n\n...
-        // Each additional \n after the initial \n\n represents another empty row
-        let mut check_pos = abs_pos + 2;
-        while check_pos < input.len() && input[check_pos] == b'\n' {
-            // Found another \n, meaning another \n\n pattern (overlapping)
-            boundaries.push(check_pos - 1);
-            check_pos += 1;
-        }
-
-        // Continue searching after all the consecutive newlines we just processed
-        pos = check_pos;
-    }
-
-    // Edge case: if no double newlines found, treat as single row
-    if boundaries.is_empty() {
-        let row = parse_row_bytes(input);
-        return if row.is_empty() {
-            Vec::new()
-        } else {
-            vec![row]
-        };
-    }
-
-    // Build row slices, handling potentially overlapping boundaries from empty rows
-    let mut row_slices: Vec<&[u8]> = Vec::new();
-    let mut start = 0;
-
-    for &boundary in &boundaries {
-        // For overlapping boundaries (from empty rows), boundary might be < start
-        // In that case, we have an empty row
-        if boundary < start {
-            row_slices.push(b"");
-            // Still need to advance start past this empty row's \n\n
-            start = boundary + 2;
-        } else {
-            row_slices.push(&input[start..boundary]);
-            start = boundary + 2;
-        }
-    }
-
-    // Handle remaining data after final "\n\n" boundary (if any)
-    if start < input.len() {
-        row_slices.push(&input[start..]);
-    }
-
-    // Parse rows in parallel - fast path, no string contains checks
-    row_slices
-        .par_iter()
-        .map(|&slice| parse_row_bytes(slice))
-        .collect()
-}
-
-/// Parse a single row from a byte slice.
-fn parse_row_bytes(row: &[u8]) -> Vec<Vec<u8>> {
-    if row.is_empty() {
-        return Vec::new();
-    }
-
-    let mut cells = Vec::new();
-    let mut start = 0;
-
-    for (pos, &b) in row.iter().enumerate() {
-        if b == b'\n' {
-            if pos > start {
-                cells.push(unescape_bytes(&row[start..pos]));
-            } else {
-                // Empty cell at position (consecutive newlines within a row shouldn't happen in valid NSV)
-                cells.push(Vec::new());
+    for i in 1..num_threads {
+        let nominal = i * chunk_size;
+        if let Some(offset) = finder.find(&input[nominal..]) {
+            let split = nominal + offset + 2; // byte after \n\n
+            if split < input.len() {
+                splits.push(split);
             }
-            start = pos + 1;
         }
     }
+    splits.push(input.len());
+    splits.dedup();
 
-    // Handle last cell if no trailing newline
-    if start < row.len() {
-        cells.push(unescape_bytes(&row[start..]));
+    if splits.len() <= 2 {
+        return decode_bytes_sequential(input);
     }
 
-    cells
+    // Parse each chunk in parallel. Each chunk starts at a row boundary
+    // (or byte 0), so the sequential parser produces correct results per chunk.
+    let chunks: Vec<&[u8]> = splits.windows(2).map(|w| &input[w[0]..w[1]]).collect();
+
+    let chunk_results: Vec<Vec<Vec<Vec<u8>>>> = chunks
+        .par_iter()
+        .map(|chunk| decode_bytes_sequential(chunk))
+        .collect();
+
+    let total_rows: usize = chunk_results.iter().map(|r| r.len()).sum();
+    let mut result = Vec::with_capacity(total_rows);
+    for chunk_rows in chunk_results {
+        result.extend(chunk_rows);
+    }
+    result
 }
 
 /// Unescape a single NSV cell.

@@ -1,7 +1,8 @@
-//! A/B benchmark: old memmem(\n\n) vs new memchr(\n) parallel decoder.
+//! A/B benchmark: three parallel decoding strategies.
 //!
-//! Generates a Champernowne-style fixture (~97 MB) where each natural number
-//! becomes a row with one digit per cell, then decodes it with both implementations.
+//!   OLD     — sequential memmem(\n\n) scan of entire input, then rayon per row
+//!   SERIAL  — sequential memchr(\n) scan of entire input, rayon only for unescape
+//!   CHUNKED — split input into N equal byte chunks, each worker does full parse
 //!
 //! Usage: cargo run --release --example bench_ab
 
@@ -10,7 +11,7 @@ use std::time::Instant;
 use memchr::memmem;
 use rayon::prelude::*;
 
-// ── shared unescape (identical in both paths) ────────────────────────────
+// ── shared unescape (identical in all paths) ─────────────────────────────
 
 fn unescape_bytes(s: &[u8]) -> Vec<u8> {
     if s == b"\\" {
@@ -41,7 +42,7 @@ fn unescape_bytes(s: &[u8]) -> Vec<u8> {
     out
 }
 
-// ── OLD: memmem(\n\n) + parse_row_bytes ──────────────────────────────────
+// ── OLD: sequential memmem(\n\n) scan + rayon per row ────────────────────
 
 fn parse_row_bytes(row: &[u8]) -> Vec<Vec<u8>> {
     if row.is_empty() {
@@ -115,9 +116,9 @@ fn decode_old(input: &[u8]) -> Vec<Vec<Vec<u8>>> {
         .collect()
 }
 
-// ── NEW: memchr(\n) single-pass ──────────────────────────────────────────
+// ── SERIAL: sequential memchr(\n) scan, rayon only for unescape ──────────
 
-fn decode_new(input: &[u8]) -> Vec<Vec<Vec<u8>>> {
+fn decode_serial(input: &[u8]) -> Vec<Vec<Vec<u8>>> {
     if input.is_empty() {
         return Vec::new();
     }
@@ -147,6 +148,12 @@ fn decode_new(input: &[u8]) -> Vec<Vec<Vec<u8>>> {
         .collect()
 }
 
+// ── CHUNKED: uses the library's new chunked parallel implementation ──────
+
+fn decode_chunked(input: &[u8]) -> Vec<Vec<Vec<u8>>> {
+    nsv::decode_bytes(input)
+}
+
 // ── Champernowne fixture generator ──────────────────────────────────────
 
 fn generate_champernowne(target_bytes: usize) -> Vec<u8> {
@@ -154,13 +161,12 @@ fn generate_champernowne(target_bytes: usize) -> Vec<u8> {
     let mut n: u64 = 1;
 
     while buf.len() < target_bytes {
-        // Each digit of n becomes a cell: "d\n", row terminated by extra "\n"
         let s = n.to_string();
         for b in s.bytes() {
             buf.push(b);
             buf.push(b'\n');
         }
-        buf.push(b'\n'); // row terminator
+        buf.push(b'\n');
         n += 1;
     }
 
@@ -184,7 +190,6 @@ fn bench_fn(name: &str, input: &[u8], f: fn(&[u8]) -> Vec<Vec<Vec<u8>>>, iters: 
         let t = Instant::now();
         let result = f(input);
         let elapsed = t.elapsed();
-        // Prevent dead-code elimination
         std::hint::black_box(&result);
         drop(result);
         times.push(elapsed);
@@ -203,25 +208,26 @@ fn bench_fn(name: &str, input: &[u8], f: fn(&[u8]) -> Vec<Vec<Vec<u8>>>, iters: 
 }
 
 fn main() {
+    eprintln!("Cores: {}", rayon::current_num_threads());
     let iters = 7;
 
     // ── Champernowne: many tiny cells, high newline density ─────────
-    // Scale to ~10 MB to stay within memory (output is ~10x input due to Vec overhead)
     let target = 2 * 1024 * 1024;
     let input = generate_champernowne(target);
 
     eprintln!("\n=== Champernowne ~2 MB ({iters} iterations) ===");
     bench_fn("OLD", &input, decode_old, iters);
-    bench_fn("NEW", &input, decode_new, iters);
+    bench_fn("SERIAL", &input, decode_serial, iters);
+    bench_fn("CHUNKED", &input, decode_chunked, iters);
 
     // Verify correctness
     let old_result = decode_old(&input);
-    let new_result = decode_new(&input);
-    assert_eq!(old_result.len(), new_result.len(), "row count mismatch");
-    assert_eq!(old_result, new_result, "output mismatch");
+    let chunked_result = decode_chunked(&input);
+    assert_eq!(old_result.len(), chunked_result.len(), "row count mismatch");
+    assert_eq!(old_result, chunked_result, "output mismatch");
     eprintln!("  Correctness: PASS ({} rows identical)", old_result.len());
     drop(old_result);
-    drop(new_result);
+    drop(chunked_result);
 
     // ── Synthetic wide table: fewer rows, more cells per row ────────
     eprintln!("\n=== Synthetic 100K rows x 10 cols ===");
@@ -237,7 +243,8 @@ fn main() {
         wide_bytes.len() as f64 / (1024.0 * 1024.0)
     );
     bench_fn("OLD", wide_bytes, decode_old, iters);
-    bench_fn("NEW", wide_bytes, decode_new, iters);
+    bench_fn("SERIAL", wide_bytes, decode_serial, iters);
+    bench_fn("CHUNKED", wide_bytes, decode_chunked, iters);
 
     // ── Synthetic with escapes: backslash-heavy data ────────────────
     eprintln!("\n=== Escape-heavy 50K rows x 10 cols ===");
@@ -265,5 +272,6 @@ fn main() {
         escape_bytes.len() as f64 / (1024.0 * 1024.0)
     );
     bench_fn("OLD", escape_bytes, decode_old, iters);
-    bench_fn("NEW", escape_bytes, decode_new, iters);
+    bench_fn("SERIAL", escape_bytes, decode_serial, iters);
+    bench_fn("CHUNKED", escape_bytes, decode_chunked, iters);
 }
