@@ -221,209 +221,9 @@ pub fn escape_bytes(s: &[u8]) -> Vec<u8> {
 
 // ── Projected (column-selective) parsing ─────────────────────────────
 //
-// Exploits the NSV property that row alignment recovery from any byte
-// position is a trivial forward scan for `\n\n`.  Each parallel worker
-// starts at a row boundary and always knows the current column index.
-//
-// `decode_bytes_projected` does a single-pass scan: tracks the column
-// index, skips non-projected columns entirely (no span, no unescape),
-// and directly produces the final `Vec<Vec<Vec<u8>>>`.
-//
-// `decode_lazy` builds a full structural index (byte-range spans)
-// without unescaping — used at bind time for header/type sniffing
-// when the projection set is not yet known.
-
-/// A byte range `[start, end)` inside the original input identifying a raw
-/// (still-escaped) cell.
-#[derive(Debug, Clone, Copy)]
-pub struct CellSpan {
-    pub start: usize,
-    pub end: usize,
-}
-
-// ── Full lazy index (unchanged, needed for bind-time header/type sniffing) ──
-
-/// A lazily-decoded NSV document.  The full structural index (row/cell
-/// boundaries) is built up front, but cell values are only unescaped on
-/// demand.  This enables zero-cost column projection: iterate over all
-/// rows, but only unescape the cells that the query actually reads.
-pub struct LazyNsv<'a> {
-    input: &'a [u8],
-    /// Each row is a `Vec<CellSpan>` — one span per cell in that row.
-    pub rows: Vec<Vec<CellSpan>>,
-}
-
-impl<'a> LazyNsv<'a> {
-    /// Consume this lazy handle and return just the structural index.
-    /// Useful for FFI where the caller owns the input separately.
-    pub fn into_rows(self) -> Vec<Vec<CellSpan>> {
-        self.rows
-    }
-
-    /// Number of rows (including the header row, if any).
-    #[inline]
-    pub fn row_count(&self) -> usize {
-        self.rows.len()
-    }
-
-    /// Number of cells in `row`.
-    #[inline]
-    pub fn col_count(&self, row: usize) -> usize {
-        self.rows.get(row).map_or(0, |r| r.len())
-    }
-
-    /// Unescape and return the cell at `(row, col)`.
-    /// Returns `None` if out of bounds.
-    pub fn get(&self, row: usize, col: usize) -> Option<Vec<u8>> {
-        let span = self.rows.get(row)?.get(col)?;
-        Some(unescape_bytes(&self.input[span.start..span.end]))
-    }
-
-    /// Return the raw (still-escaped) bytes for the cell at `(row, col)`.
-    pub fn get_raw(&self, row: usize, col: usize) -> Option<&'a [u8]> {
-        let span = self.rows.get(row)?.get(col)?;
-        Some(&self.input[span.start..span.end])
-    }
-
-    /// Materialise only the requested `columns` (by 0-based index).
-    ///
-    /// Returns one `Vec` per row.  Each inner `Vec` has exactly
-    /// `columns.len()` entries, mapped in the same order as `columns`.
-    /// Out-of-range column indices produce empty `Vec<u8>`.
-    pub fn project(&self, columns: &[usize]) -> Vec<Vec<Vec<u8>>> {
-        self.rows
-            .iter()
-            .map(|row| {
-                columns
-                    .iter()
-                    .map(|&ci| {
-                        row.get(ci)
-                            .map(|span| unescape_bytes(&self.input[span.start..span.end]))
-                            .unwrap_or_default()
-                    })
-                    .collect()
-            })
-            .collect()
-    }
-}
-
-/// Build a structural index over `input` without unescaping any cells.
-///
-/// Cost: one linear scan of the input (same as `decode_bytes` minus the
-/// per-cell `unescape_bytes` calls).  For large inputs the indexing pass
-/// is parallelised just like `decode_bytes`.
-pub fn decode_lazy(input: &[u8]) -> LazyNsv<'_> {
-    if input.is_empty() {
-        return LazyNsv {
-            input,
-            rows: Vec::new(),
-        };
-    }
-
-    let rows = if input.len() < PARALLEL_THRESHOLD {
-        index_sequential(input)
-    } else {
-        index_parallel(input)
-    };
-
-    LazyNsv { input, rows }
-}
-
-/// Sequential structural indexing — mirrors `decode_bytes_sequential` but
-/// records `CellSpan`s instead of calling `unescape_bytes`.
-fn index_sequential(input: &[u8]) -> Vec<Vec<CellSpan>> {
-    let mut data = Vec::new();
-    let mut row: Vec<CellSpan> = Vec::new();
-    let mut start = 0;
-
-    for (pos, &b) in input.iter().enumerate() {
-        if b == b'\n' {
-            if pos > start {
-                row.push(CellSpan { start, end: pos });
-            } else {
-                data.push(row);
-                row = Vec::new();
-            }
-            start = pos + 1;
-        }
-    }
-
-    if start < input.len() {
-        row.push(CellSpan {
-            start,
-            end: input.len(),
-        });
-    }
-
-    if !row.is_empty() {
-        data.push(row);
-    }
-
-    data
-}
-
-/// Parallel structural indexing — mirrors `decode_bytes_parallel`.
-fn index_parallel(input: &[u8]) -> Vec<Vec<CellSpan>> {
-    let num_threads = rayon::current_num_threads();
-    let chunk_size = input.len() / num_threads;
-
-    if chunk_size == 0 {
-        return index_sequential(input);
-    }
-
-    let finder = memmem::Finder::new(b"\n\n");
-    let mut splits = Vec::with_capacity(num_threads + 1);
-    splits.push(0usize);
-
-    for i in 1..num_threads {
-        let nominal = i * chunk_size;
-        if let Some(offset) = finder.find(&input[nominal..]) {
-            let split = nominal + offset + 2;
-            if split < input.len() {
-                splits.push(split);
-            }
-        }
-    }
-    splits.push(input.len());
-    splits.dedup();
-
-    if splits.len() <= 2 {
-        return index_sequential(input);
-    }
-
-    let chunks: Vec<(usize, &[u8])> = splits
-        .windows(2)
-        .map(|w| (w[0], &input[w[0]..w[1]]))
-        .collect();
-
-    let chunk_results: Vec<Vec<Vec<CellSpan>>> = chunks
-        .par_iter()
-        .map(|&(base_offset, chunk)| {
-            // Index within the chunk, then shift spans to absolute positions
-            let local = index_sequential(chunk);
-            local
-                .into_iter()
-                .map(|row| {
-                    row.into_iter()
-                        .map(|span| CellSpan {
-                            start: span.start + base_offset,
-                            end: span.end + base_offset,
-                        })
-                        .collect()
-                })
-                .collect()
-        })
-        .collect();
-
-    let total_rows: usize = chunk_results.iter().map(|r| r.len()).sum();
-    let mut result = Vec::with_capacity(total_rows);
-    for chunk_rows in chunk_results {
-        result.extend(chunk_rows);
-    }
-    result
-}
-
-// ── Single-pass projected decode (scan + unescape in one pass) ──────
+// Single-pass scan that tracks the column index, skips non-projected
+// columns entirely (no allocation, no unescape), and directly produces
+// the final `Vec<Vec<Vec<u8>>>`.
 
 /// Build a column-map: `col_map[original_col] = projected_index`.
 /// Entries for non-projected columns are `usize::MAX`.
@@ -466,7 +266,6 @@ fn decode_projected_sequential(input: &[u8], columns: &[usize]) -> Vec<Vec<Vec<u
     for (pos, &b) in input.iter().enumerate() {
         if b == b'\n' {
             if pos > start {
-                // Cell boundary
                 if col_idx <= max_col {
                     if let Some(&proj_idx) = col_map.get(col_idx) {
                         if proj_idx != usize::MAX {
@@ -477,7 +276,6 @@ fn decode_projected_sequential(input: &[u8], columns: &[usize]) -> Vec<Vec<Vec<u
                 col_idx += 1;
                 row_has_cells = true;
             } else {
-                // Row boundary
                 if row_has_cells || !data.is_empty() || col_idx == 0 {
                     data.push(row);
                     row = vec![Vec::new(); stride];
@@ -489,7 +287,6 @@ fn decode_projected_sequential(input: &[u8], columns: &[usize]) -> Vec<Vec<Vec<u
         }
     }
 
-    // Trailing cell
     if start < input.len() {
         if col_idx <= max_col {
             if let Some(&proj_idx) = col_map.get(col_idx) {
@@ -1122,69 +919,12 @@ mod tests {
         );
     }
 
-    // ── LazyNsv / projected tests ──
-
-    #[test]
-    fn test_lazy_matches_decode() {
-        let nsv = b"col1\ncol2\ncol3\n\na\nb\nc\n\nd\ne\nf\n\n";
-        let lazy = decode_lazy(nsv);
-        let full = decode_bytes(nsv);
-
-        assert_eq!(lazy.row_count(), full.len());
-        for (ri, row) in full.iter().enumerate() {
-            assert_eq!(lazy.col_count(ri), row.len());
-            for (ci, cell) in row.iter().enumerate() {
-                assert_eq!(lazy.get(ri, ci).unwrap(), *cell);
-            }
-        }
-    }
-
-    #[test]
-    fn test_lazy_empty_input() {
-        let lazy = decode_lazy(b"");
-        assert_eq!(lazy.row_count(), 0);
-        assert!(lazy.get(0, 0).is_none());
-    }
-
-    #[test]
-    fn test_lazy_empty_cells() {
-        let nsv = b"a\n\\\nb\n\n\\\nc\n\\\n\n";
-        let lazy = decode_lazy(nsv);
-        let full = decode_bytes(nsv);
-
-        assert_eq!(lazy.row_count(), full.len());
-        for (ri, row) in full.iter().enumerate() {
-            for (ci, cell) in row.iter().enumerate() {
-                assert_eq!(lazy.get(ri, ci).unwrap(), *cell);
-            }
-        }
-    }
-
-    #[test]
-    fn test_lazy_escape_sequences() {
-        let nsv = b"Line 1\\nLine 2\nBackslash: \\\\\n\n";
-        let lazy = decode_lazy(nsv);
-        assert_eq!(lazy.get(0, 0).unwrap(), b"Line 1\nLine 2");
-        assert_eq!(lazy.get(0, 1).unwrap(), b"Backslash: \\");
-    }
-
-    #[test]
-    fn test_lazy_get_raw() {
-        let nsv = b"Line 1\\nLine 2\nhello\n\n";
-        let lazy = decode_lazy(nsv);
-        // Raw should be the escaped form
-        assert_eq!(lazy.get_raw(0, 0).unwrap(), b"Line 1\\nLine 2");
-        // No escaping needed
-        assert_eq!(lazy.get_raw(0, 1).unwrap(), b"hello");
-    }
+    // ── Projected decode tests ──
 
     #[test]
     fn test_project_subset() {
         let nsv = b"c0\nc1\nc2\nc3\n\na\nb\nc\nd\n\ne\nf\ng\nh\n\n";
-        let lazy = decode_lazy(nsv);
-
-        // Project only columns 0 and 2
-        let projected = lazy.project(&[0, 2]);
+        let projected = decode_bytes_projected(nsv, &[0, 2]);
         assert_eq!(projected.len(), 3);
         assert_eq!(projected[0], vec![b"c0".to_vec(), b"c2".to_vec()]);
         assert_eq!(projected[1], vec![b"a".to_vec(), b"c".to_vec()]);
@@ -1194,10 +934,7 @@ mod tests {
     #[test]
     fn test_project_single_column() {
         let nsv = b"name\nage\nsalary\n\nAlice\n30\n50000\n\nBob\n25\n75000\n\n";
-        let lazy = decode_lazy(nsv);
-
-        // Project only column 1 (age)
-        let projected = lazy.project(&[1]);
+        let projected = decode_bytes_projected(nsv, &[1]);
         assert_eq!(projected.len(), 3);
         assert_eq!(projected[0], vec![b"age".to_vec()]);
         assert_eq!(projected[1], vec![b"30".to_vec()]);
@@ -1207,10 +944,7 @@ mod tests {
     #[test]
     fn test_project_reorder() {
         let nsv = b"a\nb\nc\n\n1\n2\n3\n\n";
-        let lazy = decode_lazy(nsv);
-
-        // Columns in reversed order
-        let projected = lazy.project(&[2, 0]);
+        let projected = decode_bytes_projected(nsv, &[2, 0]);
         assert_eq!(projected[0], vec![b"c".to_vec(), b"a".to_vec()]);
         assert_eq!(projected[1], vec![b"3".to_vec(), b"1".to_vec()]);
     }
@@ -1218,68 +952,16 @@ mod tests {
     #[test]
     fn test_project_out_of_range() {
         let nsv = b"a\nb\n\n";
-        let lazy = decode_lazy(nsv);
-
-        // Column 5 is out of range — should produce empty vec
-        let projected = lazy.project(&[0, 5]);
+        let projected = decode_bytes_projected(nsv, &[0, 5]);
         assert_eq!(projected[0], vec![b"a".to_vec(), b"".to_vec()]);
     }
 
     #[test]
-    fn test_decode_bytes_projected_convenience() {
+    fn test_projected_matches_full() {
         let nsv = b"c0\nc1\nc2\n\na\nb\nc\n\n";
-        let projected = decode_bytes_projected(nsv, &[1]);
-        assert_eq!(projected.len(), 2);
-        assert_eq!(projected[0], vec![b"c1".to_vec()]);
-        assert_eq!(projected[1], vec![b"b".to_vec()]);
-    }
-
-    #[test]
-    fn test_lazy_large_parallel() {
-        // Generate enough data to trigger parallel indexing
-        let large_data: Vec<Vec<String>> = (0..100_000)
-            .map(|i| vec![format!("row{}", i), format!("data{}", i)])
-            .collect();
-        let encoded = encode(&large_data);
-        let encoded_bytes = encoded.as_bytes();
-        assert!(encoded_bytes.len() > PARALLEL_THRESHOLD);
-
-        let lazy = decode_lazy(encoded_bytes);
-        let full = decode_bytes(encoded_bytes);
-
-        assert_eq!(lazy.row_count(), full.len());
-        // Spot-check some rows
-        for ri in [0, 1, 1000, 50_000, 99_999] {
-            assert_eq!(lazy.col_count(ri), full[ri].len());
-            for ci in 0..full[ri].len() {
-                assert_eq!(lazy.get(ri, ci).unwrap(), full[ri][ci]);
-            }
-        }
-    }
-
-    #[test]
-    fn test_lazy_parallel_with_empty_rows() {
-        let mut data = Vec::new();
-        for i in 0..10_000 {
-            data.push(vec![format!("value{}", i)]);
-            if i % 100 == 0 {
-                data.push(vec![]);
-            }
-        }
-        let encoded = encode(&data);
-        let encoded_bytes = encoded.as_bytes();
-        assert!(encoded_bytes.len() > PARALLEL_THRESHOLD);
-
-        let lazy = decode_lazy(encoded_bytes);
-        let full = decode_bytes(encoded_bytes);
-
-        assert_eq!(lazy.row_count(), full.len());
-        for (ri, row) in full.iter().enumerate() {
-            assert_eq!(lazy.col_count(ri), row.len());
-            for (ci, cell) in row.iter().enumerate() {
-                assert_eq!(lazy.get(ri, ci).unwrap(), *cell);
-            }
-        }
+        let full = decode_bytes(nsv);
+        let projected = decode_bytes_projected(nsv, &[0, 1, 2]);
+        assert_eq!(projected, full);
     }
 
     #[test]
@@ -1296,7 +978,6 @@ mod tests {
         let encoded_bytes = encoded.as_bytes();
         assert!(encoded_bytes.len() > PARALLEL_THRESHOLD);
 
-        // Project only the last column (no escaping needed)
         let projected = decode_bytes_projected(encoded_bytes, &[2]);
         assert_eq!(projected.len(), data.len());
         for (ri, row) in data.iter().enumerate() {
@@ -1306,7 +987,6 @@ mod tests {
             );
         }
 
-        // Project all columns and verify matches full decode
         let full = decode_bytes(encoded_bytes);
         let projected_all = decode_bytes_projected(encoded_bytes, &[0, 1, 2]);
         assert_eq!(projected_all, full);
