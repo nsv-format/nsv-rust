@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use nsv::{encode, decode, decode_bytes, decode_bytes_projected, decode_lazy};
+use nsv::{encode, decode, decode_bytes, decode_bytes_projected};
 
 fn generate_test_data(rows: usize, cells_per_row: usize) -> Vec<Vec<String>> {
     (0..rows)
@@ -83,10 +83,6 @@ fn bench_projection_10k(c: &mut Criterion) {
         b.iter(|| decode_bytes(black_box(nsv_bytes)))
     });
 
-    group.bench_function("lazy_index_only", |b| {
-        b.iter(|| decode_lazy(black_box(nsv_bytes)))
-    });
-
     group.bench_function("projected_1_of_10", |b| {
         b.iter(|| decode_bytes_projected(black_box(nsv_bytes), &[0]))
     });
@@ -115,10 +111,6 @@ fn bench_projection_100k(c: &mut Criterion) {
 
     group.bench_function("full_decode", |b| {
         b.iter(|| decode_bytes(black_box(nsv_bytes)))
-    });
-
-    group.bench_function("lazy_index_only", |b| {
-        b.iter(|| decode_lazy(black_box(nsv_bytes)))
     });
 
     group.bench_function("projected_1_of_10", |b| {
