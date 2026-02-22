@@ -221,22 +221,17 @@ pub fn escape_bytes(s: &[u8]) -> Vec<u8> {
 
 // ── Projected (column-selective) parsing ─────────────────────────────
 //
-// Exploits the NSV property that structure recovery (row/cell boundaries)
-// is independent of unescaping.  For queries that only need a subset of
-// columns, we scan the full byte stream to find boundaries but only
-// unescape cells in the requested columns.
+// Exploits the NSV property that row alignment recovery from any byte
+// position is a trivial forward scan for `\n\n`.  Each parallel worker
+// starts at a row boundary and always knows the current column index.
 //
-// Two levels of API:
+// `decode_bytes_projected` does a single-pass scan: tracks the column
+// index, skips non-projected columns entirely (no span, no unescape),
+// and directly produces the final `Vec<Vec<Vec<u8>>>`.
 //
-// 1. `decode_bytes_projected` — single-pass scan that directly produces
-//    the final `Vec<Vec<Vec<u8>>>` for projected columns.  No intermediate
-//    index.  Best when the caller wants materialised values immediately.
-//
-// 2. `decode_lazy` / `decode_lazy_projected` — builds a structural index
-//    (byte-range spans) without unescaping.  Cells are unescaped on demand.
-//    `decode_lazy_projected` uses flat storage (single `Vec<CellSpan>`)
-//    and only records spans for projected columns, eliminating the
-//    per-row heap allocation of the full `Vec<Vec<CellSpan>>` index.
+// `decode_lazy` builds a full structural index (byte-range spans)
+// without unescaping — used at bind time for header/type sniffing
+// when the projection set is not yet known.
 
 /// A byte range `[start, end)` inside the original input identifying a raw
 /// (still-escaped) cell.
@@ -428,49 +423,7 @@ fn index_parallel(input: &[u8]) -> Vec<Vec<CellSpan>> {
     result
 }
 
-// ── Projected lazy index (flat storage, only projected columns) ─────
-
-/// An empty/sentinel span used for padding when a row has fewer columns
-/// than a projected index requires.
-const EMPTY_SPAN: CellSpan = CellSpan { start: 0, end: 0 };
-
-/// A lazily-decoded NSV document indexed only at projected columns.
-///
-/// Uses a single flat `Vec<CellSpan>` — one allocation total, not one per
-/// row.  `spans[row * stride + proj_idx]` gives the byte range for the
-/// `proj_idx`-th projected column in `row`.
-pub struct ProjectedNsv<'a> {
-    input: &'a [u8],
-    /// Number of projected columns (stride of the flat array).
-    pub stride: usize,
-    pub num_rows: usize,
-    /// Flat: `spans[row * stride + proj_col_idx]`.
-    pub spans: Vec<CellSpan>,
-}
-
-impl<'a> ProjectedNsv<'a> {
-    /// Unescape and return the cell at `(row, proj_col)`.
-    pub fn get(&self, row: usize, proj_col: usize) -> Option<Vec<u8>> {
-        if row >= self.num_rows || proj_col >= self.stride {
-            return None;
-        }
-        let span = &self.spans[row * self.stride + proj_col];
-        if span.start == span.end {
-            // Empty span — either genuinely empty cell or out-of-range column
-            return Some(Vec::new());
-        }
-        Some(unescape_bytes(&self.input[span.start..span.end]))
-    }
-
-    /// Return the raw (still-escaped) bytes at `(row, proj_col)`.
-    pub fn get_raw(&self, row: usize, proj_col: usize) -> Option<&'a [u8]> {
-        if row >= self.num_rows || proj_col >= self.stride {
-            return None;
-        }
-        let span = &self.spans[row * self.stride + proj_col];
-        Some(&self.input[span.start..span.end])
-    }
-}
+// ── Single-pass projected decode (scan + unescape in one pass) ──────
 
 /// Build a column-map: `col_map[original_col] = projected_index`.
 /// Entries for non-projected columns are `usize::MAX`.
@@ -482,174 +435,6 @@ fn build_col_map(columns: &[usize]) -> (Vec<usize>, usize) {
     }
     (col_map, max_col)
 }
-
-/// Build a projected structural index: single-pass scan, flat storage.
-///
-/// Only records spans for columns whose 0-based index is in `columns`.
-/// Each worker (parallel or sequential) starts at a row boundary, so it
-/// always knows the current column count from 0.
-pub fn decode_lazy_projected<'a>(input: &'a [u8], columns: &[usize]) -> ProjectedNsv<'a> {
-    let stride = columns.len();
-    if input.is_empty() || stride == 0 {
-        return ProjectedNsv {
-            input,
-            stride,
-            num_rows: 0,
-            spans: Vec::new(),
-        };
-    }
-
-    let (col_map, max_col) = build_col_map(columns);
-
-    let (num_rows, spans) = if input.len() < PARALLEL_THRESHOLD {
-        index_projected_sequential(input, &col_map, max_col, stride)
-    } else {
-        index_projected_parallel(input, &col_map, max_col, stride)
-    };
-
-    ProjectedNsv {
-        input,
-        stride,
-        num_rows,
-        spans,
-    }
-}
-
-/// Sequential projected indexing.  Returns `(num_rows, flat_spans)`.
-fn index_projected_sequential(
-    input: &[u8],
-    col_map: &[usize],
-    max_col: usize,
-    stride: usize,
-) -> (usize, Vec<CellSpan>) {
-    let mut spans = Vec::new();
-    let mut col_idx: usize = 0;
-    let mut start = 0;
-    let mut row_base = spans.len(); // start of current row's slots
-
-    // Pre-allocate a row's worth of sentinel spans
-    spans.extend(std::iter::repeat(EMPTY_SPAN).take(stride));
-
-    for (pos, &b) in input.iter().enumerate() {
-        if b == b'\n' {
-            if pos > start {
-                // Cell boundary — record if this column is projected
-                if col_idx <= max_col {
-                    if let Some(&proj_idx) = col_map.get(col_idx) {
-                        if proj_idx != usize::MAX {
-                            spans[row_base + proj_idx] = CellSpan { start, end: pos };
-                        }
-                    }
-                }
-                col_idx += 1;
-            } else {
-                // Row boundary (\n\n) — finalise this row, start next
-                col_idx = 0;
-                row_base = spans.len();
-                spans.extend(std::iter::repeat(EMPTY_SPAN).take(stride));
-            }
-            start = pos + 1;
-        }
-    }
-
-    // Trailing cell without final LF
-    if start < input.len() {
-        if col_idx <= max_col {
-            if let Some(&proj_idx) = col_map.get(col_idx) {
-                if proj_idx != usize::MAX {
-                    spans[row_base + proj_idx] = CellSpan {
-                        start,
-                        end: input.len(),
-                    };
-                }
-            }
-        }
-        col_idx += 1;
-    }
-
-    // If we wrote any cells into the last row slot, count it
-    let num_rows = if col_idx > 0 {
-        spans.len() / stride
-    } else {
-        // Last row slot was pre-allocated but unused (input ended with \n\n)
-        spans.truncate(spans.len() - stride);
-        spans.len() / stride
-    };
-
-    (num_rows, spans)
-}
-
-/// Parallel projected indexing.
-fn index_projected_parallel(
-    input: &[u8],
-    col_map: &[usize],
-    max_col: usize,
-    stride: usize,
-) -> (usize, Vec<CellSpan>) {
-    let num_threads = rayon::current_num_threads();
-    let chunk_size = input.len() / num_threads;
-
-    if chunk_size == 0 {
-        return index_projected_sequential(input, col_map, max_col, stride);
-    }
-
-    let finder = memmem::Finder::new(b"\n\n");
-    let mut splits = Vec::with_capacity(num_threads + 1);
-    splits.push(0usize);
-
-    for i in 1..num_threads {
-        let nominal = i * chunk_size;
-        if let Some(offset) = finder.find(&input[nominal..]) {
-            let split = nominal + offset + 2;
-            if split < input.len() {
-                splits.push(split);
-            }
-        }
-    }
-    splits.push(input.len());
-    splits.dedup();
-
-    if splits.len() <= 2 {
-        return index_projected_sequential(input, col_map, max_col, stride);
-    }
-
-    let chunks: Vec<&[u8]> = splits.windows(2).map(|w| &input[w[0]..w[1]]).collect();
-    let offsets: Vec<usize> = splits[..splits.len() - 1].to_vec();
-
-    let chunk_results: Vec<(usize, Vec<CellSpan>)> = chunks
-        .par_iter()
-        .zip(offsets.par_iter())
-        .map(|(chunk, &base_offset)| {
-            let (nrows, local_spans) =
-                index_projected_sequential(chunk, col_map, max_col, stride);
-            // Shift spans to absolute positions
-            let shifted: Vec<CellSpan> = local_spans
-                .into_iter()
-                .map(|span| {
-                    if span.start == span.end {
-                        span // empty sentinel — leave as-is
-                    } else {
-                        CellSpan {
-                            start: span.start + base_offset,
-                            end: span.end + base_offset,
-                        }
-                    }
-                })
-                .collect();
-            (nrows, shifted)
-        })
-        .collect();
-
-    let total_rows: usize = chunk_results.iter().map(|(n, _)| n).sum();
-    let mut result = Vec::with_capacity(total_rows * stride);
-    for (_, chunk_spans) in chunk_results {
-        result.extend(chunk_spans);
-    }
-
-    (total_rows, result)
-}
-
-// ── Single-pass projected decode (scan + unescape in one pass) ──────
 
 /// Decode only the specified columns from raw bytes.
 ///
