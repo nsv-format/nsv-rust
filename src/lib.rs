@@ -950,6 +950,18 @@ mod tests {
     }
 
     #[test]
+    fn test_project_full_permutation() {
+        // All columns requested but in non-identity order — ensures
+        // reordering works even when no columns are actually pruned.
+        let nsv = b"a\nb\nc\n\n1\n2\n3\n\n4\n5\n6\n\n";
+        let projected = decode_bytes_projected(nsv, &[2, 0, 1]);
+        assert_eq!(projected.len(), 3); // header + 2 data rows
+        assert_eq!(projected[0], vec![b"c".to_vec(), b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(projected[1], vec![b"3".to_vec(), b"1".to_vec(), b"2".to_vec()]);
+        assert_eq!(projected[2], vec![b"6".to_vec(), b"4".to_vec(), b"5".to_vec()]);
+    }
+
+    #[test]
     fn test_project_out_of_range() {
         let nsv = b"a\nb\n\n";
         let projected = decode_bytes_projected(nsv, &[0, 5]);
