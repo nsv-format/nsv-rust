@@ -21,6 +21,8 @@ pub mod util;
 use memchr::memmem;
 use rayon::prelude::*;
 
+use std::io::{self, BufRead, Write};
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Threshold for using parallel parsing (64KB)
@@ -460,6 +462,256 @@ pub fn check(input: &[u8]) -> Vec<Warning> {
     }
 
     warnings
+}
+
+// ── Streaming Reader ─────────────────────────────────────────────────
+
+/// A streaming NSV reader that yields one row at a time from any `BufRead` source.
+///
+/// Handles arbitrary chunk boundaries transparently — `BufRead` manages
+/// the underlying buffering, and the reader consumes line by line.
+///
+/// # Example
+/// ```
+/// use std::io::Cursor;
+/// use nsv::Reader;
+///
+/// let data = "a\nb\n\nc\nd\n\n";
+/// let mut reader = Reader::new(Cursor::new(data));
+/// assert_eq!(reader.next_row(), Some(vec!["a".into(), "b".into()]));
+/// assert_eq!(reader.next_row(), Some(vec!["c".into(), "d".into()]));
+/// assert_eq!(reader.next_row(), None);
+/// ```
+pub struct Reader<R: BufRead> {
+    inner: R,
+    row: Vec<String>,
+    buf: String,
+    done: bool,
+    /// True if the last row yielded was terminated by `\n\n` (complete).
+    /// False if the last row was yielded due to EOF without a trailing empty line.
+    last_row_complete: bool,
+}
+
+impl<R: BufRead> Reader<R> {
+    /// Create a new streaming NSV reader wrapping the given `BufRead`.
+    pub fn new(reader: R) -> Self {
+        Reader {
+            inner: reader,
+            row: Vec::new(),
+            buf: String::new(),
+            done: false,
+            last_row_complete: true,
+        }
+    }
+
+    /// Read and return the next row, or `None` at EOF.
+    ///
+    /// An incomplete final row (no trailing `\n\n`) is still yielded.
+    /// Use [`was_last_row_complete`](Self::was_last_row_complete) to distinguish.
+    pub fn next_row(&mut self) -> Option<Vec<String>> {
+        if self.done {
+            return None;
+        }
+
+        loop {
+            self.buf.clear();
+            match self.inner.read_line(&mut self.buf) {
+                Ok(0) => {
+                    // EOF
+                    self.done = true;
+                    if !self.row.is_empty() {
+                        self.last_row_complete = false;
+                        return Some(std::mem::take(&mut self.row));
+                    }
+                    return None;
+                }
+                Ok(_) => {
+                    // Strip the trailing \n (read_line includes it)
+                    let line = if self.buf.ends_with('\n') {
+                        &self.buf[..self.buf.len() - 1]
+                    } else {
+                        // No trailing newline means EOF mid-line
+                        &self.buf[..]
+                    };
+
+                    if line.is_empty() {
+                        // Empty line = row terminator
+                        self.last_row_complete = true;
+                        return Some(std::mem::take(&mut self.row));
+                    } else {
+                        // Non-empty line = cell content. Unescape using existing logic.
+                        let unescaped = unescape_bytes(line.as_bytes());
+                        // SAFETY: input was &str (valid UTF-8), unescape only operates
+                        // on ASCII bytes — result is valid UTF-8.
+                        let cell = unsafe { String::from_utf8_unchecked(unescaped) };
+                        self.row.push(cell);
+                    }
+                }
+                Err(_) => {
+                    self.done = true;
+                    if !self.row.is_empty() {
+                        self.last_row_complete = false;
+                        return Some(std::mem::take(&mut self.row));
+                    }
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Returns whether the most recently yielded row was complete
+    /// (terminated by `\n\n` rather than EOF).
+    pub fn was_last_row_complete(&self) -> bool {
+        self.last_row_complete
+    }
+}
+
+impl<R: BufRead> Iterator for Reader<R> {
+    type Item = Vec<String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_row()
+    }
+}
+
+// ── Streaming Bytes Reader ──────────────────────────────────────────
+
+/// A streaming NSV reader that yields rows of `Vec<u8>` from any `BufRead` source.
+///
+/// Like [`Reader`] but operates on raw bytes without assuming UTF-8.
+pub struct BytesReader<R: BufRead> {
+    inner: R,
+    row: Vec<Vec<u8>>,
+    buf: Vec<u8>,
+    done: bool,
+    last_row_complete: bool,
+}
+
+impl<R: BufRead> BytesReader<R> {
+    pub fn new(reader: R) -> Self {
+        BytesReader {
+            inner: reader,
+            row: Vec::new(),
+            buf: Vec::new(),
+            done: false,
+            last_row_complete: true,
+        }
+    }
+
+    pub fn next_row(&mut self) -> Option<Vec<Vec<u8>>> {
+        if self.done {
+            return None;
+        }
+
+        loop {
+            self.buf.clear();
+            match self.inner.read_until(b'\n', &mut self.buf) {
+                Ok(0) => {
+                    self.done = true;
+                    if !self.row.is_empty() {
+                        self.last_row_complete = false;
+                        return Some(std::mem::take(&mut self.row));
+                    }
+                    return None;
+                }
+                Ok(_) => {
+                    let line = if self.buf.last() == Some(&b'\n') {
+                        &self.buf[..self.buf.len() - 1]
+                    } else {
+                        &self.buf[..]
+                    };
+
+                    if line.is_empty() {
+                        self.last_row_complete = true;
+                        return Some(std::mem::take(&mut self.row));
+                    } else {
+                        self.row.push(unescape_bytes(line));
+                    }
+                }
+                Err(_) => {
+                    self.done = true;
+                    if !self.row.is_empty() {
+                        self.last_row_complete = false;
+                        return Some(std::mem::take(&mut self.row));
+                    }
+                    return None;
+                }
+            }
+        }
+    }
+
+    pub fn was_last_row_complete(&self) -> bool {
+        self.last_row_complete
+    }
+}
+
+impl<R: BufRead> Iterator for BytesReader<R> {
+    type Item = Vec<Vec<u8>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_row()
+    }
+}
+
+// ── Streaming Writer ─────────────────────────────────────────────────
+
+/// A streaming NSV writer that writes one row at a time to any `Write` sink.
+///
+/// Each call to [`write_row`](Self::write_row) produces a complete,
+/// properly terminated row (`cell\ncell\n\n`).
+///
+/// # Example
+/// ```
+/// use nsv::Writer;
+///
+/// let mut buf = Vec::new();
+/// {
+///     let mut writer = Writer::new(&mut buf);
+///     writer.write_row(&["hello", "world"]).unwrap();
+///     writer.write_row(&["a", "b"]).unwrap();
+/// }
+/// assert_eq!(buf, b"hello\nworld\n\na\nb\n\n");
+/// ```
+pub struct Writer<W: Write> {
+    inner: W,
+}
+
+impl<W: Write> Writer<W> {
+    /// Create a new streaming NSV writer wrapping the given `Write` sink.
+    pub fn new(writer: W) -> Self {
+        Writer { inner: writer }
+    }
+
+    /// Write a single row of cells. Each cell is escaped, followed by `\n`.
+    /// An extra `\n` is appended to terminate the row.
+    pub fn write_row<S: AsRef<str>>(&mut self, row: &[S]) -> io::Result<()> {
+        for cell in row {
+            self.inner.write_all(&escape_bytes(cell.as_ref().as_bytes()))?;
+            self.inner.write_all(b"\n")?;
+        }
+        self.inner.write_all(b"\n")?;
+        Ok(())
+    }
+
+    /// Write a single row of raw byte cells.
+    pub fn write_row_bytes(&mut self, row: &[&[u8]]) -> io::Result<()> {
+        for cell in row {
+            self.inner.write_all(&escape_bytes(cell))?;
+            self.inner.write_all(b"\n")?;
+        }
+        self.inner.write_all(b"\n")?;
+        Ok(())
+    }
+
+    /// Flush the underlying writer.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+
+    /// Consume the writer and return the underlying `Write` sink.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
 }
 
 #[cfg(test)]
@@ -990,5 +1242,379 @@ mod tests {
         let full = decode_bytes(encoded_bytes);
         let projected_all = decode_bytes_projected(encoded_bytes, &[0, 1, 2]);
         assert_eq!(projected_all, full);
+    }
+
+    // ── Streaming Reader tests ──
+
+    use std::io::Cursor;
+
+    #[test]
+    fn test_reader_simple() {
+        let input = "a\nb\n\nc\nd\n\n";
+        let rows: Vec<Vec<String>> = Reader::new(Cursor::new(input)).collect();
+        assert_eq!(rows, decode(input));
+    }
+
+    #[test]
+    fn test_reader_empty_input() {
+        let rows: Vec<Vec<String>> = Reader::new(Cursor::new("")).collect();
+        assert_eq!(rows, Vec::<Vec<String>>::new());
+    }
+
+    #[test]
+    fn test_reader_empty_rows() {
+        let input = "\n\n\n\n";
+        let rows: Vec<Vec<String>> = Reader::new(Cursor::new(input)).collect();
+        assert_eq!(rows, decode(input));
+    }
+
+    #[test]
+    fn test_reader_starts_with_empty_row() {
+        let input = "\n\nfirst\n\n";
+        let rows: Vec<Vec<String>> = Reader::new(Cursor::new(input)).collect();
+        assert_eq!(rows, decode(input));
+    }
+
+    #[test]
+    fn test_reader_escape_sequences() {
+        let input = "Line 1\\nLine 2\nBackslash: \\\\\nNot a newline: \\\\n\n\n";
+        let rows: Vec<Vec<String>> = Reader::new(Cursor::new(input)).collect();
+        assert_eq!(rows, decode(input));
+    }
+
+    #[test]
+    fn test_reader_empty_cells() {
+        let input = "a\n\\\nb\n\n\\\nc\n\\\n\n";
+        let rows: Vec<Vec<String>> = Reader::new(Cursor::new(input)).collect();
+        assert_eq!(rows, decode(input));
+    }
+
+    #[test]
+    fn test_reader_no_trailing_newline() {
+        let input = "a\nb";
+        let mut reader = Reader::new(Cursor::new(input));
+        let row = reader.next_row().unwrap();
+        assert_eq!(row, vec!["a".to_string(), "b".to_string()]);
+        assert!(!reader.was_last_row_complete());
+        assert_eq!(reader.next_row(), None);
+    }
+
+    #[test]
+    fn test_reader_incomplete_row_at_eof() {
+        let input = "a\nb\n\nc\nd";
+        let mut reader = Reader::new(Cursor::new(input));
+        let row1 = reader.next_row().unwrap();
+        assert_eq!(row1, vec!["a".to_string(), "b".to_string()]);
+        assert!(reader.was_last_row_complete());
+        let row2 = reader.next_row().unwrap();
+        assert_eq!(row2, vec!["c".to_string(), "d".to_string()]);
+        assert!(!reader.was_last_row_complete());
+        assert_eq!(reader.next_row(), None);
+    }
+
+    #[test]
+    fn test_reader_dangling_backslash() {
+        let input = "text\\\n\n";
+        let rows: Vec<Vec<String>> = Reader::new(Cursor::new(input)).collect();
+        assert_eq!(rows, decode(input));
+    }
+
+    #[test]
+    fn test_reader_unrecognized_escape() {
+        let input = "\\x41\\t\\r\n\n";
+        let rows: Vec<Vec<String>> = Reader::new(Cursor::new(input)).collect();
+        assert_eq!(rows, decode(input));
+    }
+
+    #[test]
+    fn test_reader_consecutive_empty_rows() {
+        let input = "first\n\n\n\nsecond\n\n";
+        let rows: Vec<Vec<String>> = Reader::new(Cursor::new(input)).collect();
+        assert_eq!(rows, decode(input));
+    }
+
+    #[test]
+    fn test_reader_only_empty_cells() {
+        // Row with only empty cells: ["", "", ""]
+        let input = "\\\n\\\n\\\n\n";
+        let rows: Vec<Vec<String>> = Reader::new(Cursor::new(input)).collect();
+        assert_eq!(rows, decode(input));
+    }
+
+    #[test]
+    fn test_reader_equivalence_batch_cases() {
+        // Test with all the canonical inputs used in batch tests
+        let inputs = vec![
+            "col1\ncol2\n\na\nb\n\nc\nd\n",
+            "a\n\\\nb\n\n\\\nc\n\\\n",
+            "Line 1\\nLine 2\nBackslash: \\\\\nNot a newline: \\\\n\n",
+            "first\n\n\n\nsecond\n",
+            "",
+            "a\nb",
+            "\n\n\n\n",
+            "\n\nfirst\n",
+            "text\\\n",
+            "\\x41\\t\\r\n",
+        ];
+
+        for input in inputs {
+            let streaming: Vec<Vec<String>> = Reader::new(Cursor::new(input)).collect();
+            let batch = decode(input);
+            assert_eq!(streaming, batch, "mismatch for input: {:?}", input);
+        }
+    }
+
+    #[test]
+    fn test_reader_one_byte_at_a_time() {
+        let inputs = vec![
+            "col1\ncol2\n\na\nb\n\nc\nd\n\n",
+            "a\n\\\nb\n\n\\\nc\n\\\n\n",
+            "first\n\n\n\nsecond\n\n",
+            "\n\n\n\n",
+            "Line 1\\nLine 2\n\n",
+        ];
+
+        for input in inputs {
+            // Use BufReader with capacity=1 over a Cursor to force tiny reads
+            let reader = io::BufReader::with_capacity(1, Cursor::new(input));
+            let streaming: Vec<Vec<String>> = Reader::new(reader).collect();
+            let batch = decode(input);
+            assert_eq!(streaming, batch, "1-byte chunk mismatch for: {:?}", input);
+        }
+    }
+
+    #[test]
+    fn test_reader_various_chunk_sizes() {
+        let input = "col1\ncol2\ncol3\n\na\nb\nc\n\nd\ne\nf\n\n";
+        let batch = decode(input);
+
+        for chunk_size in [2, 3, 5, 7, 13] {
+            let reader = io::BufReader::with_capacity(chunk_size, Cursor::new(input));
+            let streaming: Vec<Vec<String>> = Reader::new(reader).collect();
+            assert_eq!(
+                streaming, batch,
+                "chunk_size={} mismatch",
+                chunk_size
+            );
+        }
+    }
+
+    // ── Streaming BytesReader tests ──
+
+    #[test]
+    fn test_bytes_reader_equivalence() {
+        let inputs: Vec<&[u8]> = vec![
+            b"col1\ncol2\n\na\nb\n\nc\nd\n\n",
+            b"a\n\\\nb\n\n\\\nc\n\\\n\n",
+            b"\n\n\n\n",
+            b"",
+            b"a\nb",
+            b"text\\\n\n",
+        ];
+
+        for input in inputs {
+            let streaming: Vec<Vec<Vec<u8>>> = BytesReader::new(Cursor::new(input)).collect();
+            let batch = decode_bytes(input);
+            assert_eq!(streaming, batch, "bytes reader mismatch for: {:?}", input);
+        }
+    }
+
+    #[test]
+    fn test_bytes_reader_non_utf8() {
+        let cell1: Vec<u8> = vec![0xC0, 0xE9, 0xF1];
+        let cell2: Vec<u8> = vec![0xFF, 0xFE, 0x80];
+        let original = vec![vec![cell1, cell2]];
+        let encoded = encode_bytes(&original);
+
+        let streaming: Vec<Vec<Vec<u8>>> = BytesReader::new(Cursor::new(&encoded[..])).collect();
+        assert_eq!(streaming, original);
+    }
+
+    // ── Streaming Writer tests ──
+
+    #[test]
+    fn test_writer_simple() {
+        let mut buf = Vec::new();
+        {
+            let mut w = Writer::new(&mut buf);
+            w.write_row(&["hello", "world"]).unwrap();
+            w.write_row(&["a", "b"]).unwrap();
+        }
+        assert_eq!(buf, b"hello\nworld\n\na\nb\n\n");
+    }
+
+    #[test]
+    fn test_writer_empty_row() {
+        let mut buf = Vec::new();
+        {
+            let mut w = Writer::new(&mut buf);
+            let empty: &[&str] = &[];
+            w.write_row(empty).unwrap();
+        }
+        assert_eq!(buf, b"\n");
+    }
+
+    #[test]
+    fn test_writer_empty_cells() {
+        let mut buf = Vec::new();
+        {
+            let mut w = Writer::new(&mut buf);
+            w.write_row(&["", "", ""]).unwrap();
+        }
+        // Each empty cell → "\\" escaped, plus \n. Then row terminator \n.
+        assert_eq!(buf, b"\\\n\\\n\\\n\n");
+    }
+
+    #[test]
+    fn test_writer_escape_sequences() {
+        let mut buf = Vec::new();
+        {
+            let mut w = Writer::new(&mut buf);
+            w.write_row(&["line1\nline2", "back\\slash"]).unwrap();
+        }
+        assert_eq!(buf, b"line1\\nline2\nback\\\\slash\n\n");
+    }
+
+    #[test]
+    fn test_writer_row_ends_with_double_newline() {
+        let mut buf = Vec::new();
+        {
+            let mut w = Writer::new(&mut buf);
+            w.write_row(&["a"]).unwrap();
+            w.write_row(&["b", "c"]).unwrap();
+        }
+        // Verify each write_row produces output ending with \n\n
+        let s = String::from_utf8(buf).unwrap();
+        let rows: Vec<&str> = s.split("\n\n").collect();
+        // "a\n" + "" separator + "b\nc\n" + "" trailing
+        assert_eq!(rows, vec!["a", "b\nc", ""]);
+    }
+
+    #[test]
+    fn test_writer_accepts_string_slices() {
+        let mut buf = Vec::new();
+        {
+            let mut w = Writer::new(&mut buf);
+            let cells = vec!["a".to_string(), "b".to_string()];
+            w.write_row(&cells).unwrap();
+        }
+        assert_eq!(buf, b"a\nb\n\n");
+    }
+
+    #[test]
+    fn test_writer_bytes() {
+        let mut buf = Vec::new();
+        {
+            let mut w = Writer::new(&mut buf);
+            w.write_row_bytes(&[b"hello", b"world"]).unwrap();
+        }
+        assert_eq!(buf, b"hello\nworld\n\n");
+    }
+
+    // ── Round-trip tests ──
+
+    #[test]
+    fn test_roundtrip_streaming() {
+        let original = vec![
+            vec!["col1".to_string(), "col2".to_string()],
+            vec!["a".to_string(), "b".to_string()],
+            vec!["".to_string(), "value\\with\\backslash".to_string()],
+            vec!["multi\nline".to_string(), "normal".to_string()],
+        ];
+
+        // Write with Writer
+        let mut buf = Vec::new();
+        {
+            let mut w = Writer::new(&mut buf);
+            for row in &original {
+                w.write_row(row).unwrap();
+            }
+        }
+
+        // Read back with Reader
+        let decoded: Vec<Vec<String>> = Reader::new(Cursor::new(&buf[..])).collect();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_roundtrip_empty_rows() {
+        // [[], [], []] — consecutive empty rows
+        let mut buf = Vec::new();
+        {
+            let mut w = Writer::new(&mut buf);
+            let empty: &[&str] = &[];
+            w.write_row(empty).unwrap();
+            w.write_row(empty).unwrap();
+            w.write_row(empty).unwrap();
+        }
+
+        let decoded: Vec<Vec<String>> = Reader::new(Cursor::new(&buf[..])).collect();
+        assert_eq!(decoded, vec![vec![] as Vec<String>; 3]);
+    }
+
+    #[test]
+    fn test_roundtrip_large() {
+        let original: Vec<Vec<String>> = (0..1000)
+            .map(|i| {
+                vec![
+                    format!("row{}", i),
+                    format!("data with\nnewline {}", i),
+                    format!("back\\slash{}", i),
+                    "".to_string(),
+                ]
+            })
+            .collect();
+
+        let mut buf = Vec::new();
+        {
+            let mut w = Writer::new(&mut buf);
+            for row in &original {
+                w.write_row(row).unwrap();
+            }
+        }
+
+        let decoded: Vec<Vec<String>> = Reader::new(Cursor::new(&buf[..])).collect();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_streaming_matches_batch_encode() {
+        // Verify Writer output matches batch encode()
+        let data = vec![
+            vec!["a".to_string(), "b".to_string()],
+            vec!["".to_string()],
+            vec!["line\none".to_string(), "back\\slash".to_string()],
+        ];
+
+        let batch = encode(&data);
+
+        let mut streaming_buf = Vec::new();
+        {
+            let mut w = Writer::new(&mut streaming_buf);
+            for row in &data {
+                w.write_row(row).unwrap();
+            }
+        }
+
+        assert_eq!(streaming_buf, batch.as_bytes());
+    }
+
+    #[test]
+    fn test_reader_large_cells() {
+        // Test with large cells to verify no O(n²) behavior
+        let big_cell = "x".repeat(100_000);
+        let input = format!("{}\n\n", big_cell);
+        let rows: Vec<Vec<String>> = Reader::new(Cursor::new(&input)).collect();
+        assert_eq!(rows, vec![vec![big_cell]]);
+    }
+
+    #[test]
+    fn test_reader_many_cells() {
+        // Row with thousands of cells
+        let n = 5000;
+        let cells: Vec<String> = (0..n).map(|i| format!("cell{}", i)).collect();
+        let encoded = encode(&[cells.clone()]);
+        let rows: Vec<Vec<String>> = Reader::new(Cursor::new(&encoded)).collect();
+        assert_eq!(rows, vec![cells]);
     }
 }
