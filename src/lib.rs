@@ -478,11 +478,11 @@ pub struct Reader<R> {
 
 impl<R: io::Read> Reader<R> {
     pub fn new(reader: R) -> Self {
-        Reader { inner: io::BufReader::new(reader), line_buf: Vec::new(), row: Vec::new() }
+        Self::from_buf_reader(io::BufReader::new(reader))
     }
 
-    pub fn from_raw_reader(reader: R) -> Self {
-        Reader { inner: io::BufReader::with_capacity(0, reader), line_buf: Vec::new(), row: Vec::new() }
+    pub fn from_buf_reader(reader: io::BufReader<R>) -> Self {
+        Reader { inner: reader, line_buf: Vec::new(), row: Vec::new() }
     }
 
     pub fn next_row(&mut self) -> Option<Vec<Vec<u8>>> {
