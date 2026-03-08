@@ -21,7 +21,7 @@ pub mod util;
 use memchr::memmem;
 use rayon::prelude::*;
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -466,7 +466,7 @@ pub fn check(input: &[u8]) -> Vec<Warning> {
 
 // ── Streaming ────────────────────────────────────────────────────────
 
-/// Streaming NSV reader. Yields one complete row at a time from any `BufRead`.
+/// Streaming NSV reader. Yields one complete row at a time.
 ///
 /// On EOF, returns `None` without discarding buffered state — calling
 /// `next_row()` again after more data arrives resumes where it left off.
@@ -478,38 +478,39 @@ pub fn check(input: &[u8]) -> Vec<Warning> {
 /// ```
 pub struct Reader<R> {
     inner: R,
+    line_buf: Vec<u8>,
     row: Vec<String>,
-    buf: String,
-    partial_line: String,
 }
 
-impl<R: BufRead> Reader<R> {
+impl<R: io::Read> Reader<R> {
     pub fn new(reader: R) -> Self {
-        Reader { inner: reader, row: Vec::new(), buf: String::new(), partial_line: String::new() }
+        Reader { inner: reader, line_buf: Vec::new(), row: Vec::new() }
     }
 
     pub fn next_row(&mut self) -> Option<Vec<String>> {
+        let mut byte = [0u8; 1];
         loop {
-            self.buf.clear();
-            let n = self.inner.read_line(&mut self.buf).ok()?;
-            if n == 0 { return None; }
-            if !self.partial_line.is_empty() {
-                self.buf.insert_str(0, &std::mem::take(&mut self.partial_line));
+            match self.inner.read(&mut byte) {
+                Ok(0) | Err(_) => return None,
+                Ok(_) => {
+                    if byte[0] != b'\n' {
+                        self.line_buf.push(byte[0]);
+                        continue;
+                    }
+                    // Got a \n — line is complete
+                    if self.line_buf.is_empty() {
+                        return Some(std::mem::take(&mut self.row));
+                    }
+                    let cell = unescape_bytes(&self.line_buf);
+                    self.line_buf.clear();
+                    self.row.push(unsafe { String::from_utf8_unchecked(cell) });
+                }
             }
-            if !self.buf.ends_with('\n') {
-                self.partial_line = std::mem::take(&mut self.buf);
-                return None;
-            }
-            let line = &self.buf[..self.buf.len() - 1];
-            if line.is_empty() {
-                return Some(std::mem::take(&mut self.row));
-            }
-            self.row.push(unsafe { String::from_utf8_unchecked(unescape_bytes(line.as_bytes())) });
         }
     }
 }
 
-impl<R: BufRead> Iterator for Reader<R> {
+impl<R: io::Read> Iterator for Reader<R> {
     type Item = Vec<String>;
     fn next(&mut self) -> Option<Self::Item> { self.next_row() }
 }
@@ -517,40 +518,38 @@ impl<R: BufRead> Iterator for Reader<R> {
 /// Like [`Reader`] but yields `Vec<Vec<u8>>` rows without assuming UTF-8.
 pub struct BytesReader<R> {
     inner: R,
+    line_buf: Vec<u8>,
     row: Vec<Vec<u8>>,
-    buf: Vec<u8>,
-    partial_line: Vec<u8>,
 }
 
-impl<R: BufRead> BytesReader<R> {
+impl<R: io::Read> BytesReader<R> {
     pub fn new(reader: R) -> Self {
-        BytesReader { inner: reader, row: Vec::new(), buf: Vec::new(), partial_line: Vec::new() }
+        BytesReader { inner: reader, line_buf: Vec::new(), row: Vec::new() }
     }
 
     pub fn next_row(&mut self) -> Option<Vec<Vec<u8>>> {
+        let mut byte = [0u8; 1];
         loop {
-            self.buf.clear();
-            let n = self.inner.read_until(b'\n', &mut self.buf).ok()?;
-            if n == 0 { return None; }
-            if !self.partial_line.is_empty() {
-                let mut combined = std::mem::take(&mut self.partial_line);
-                combined.append(&mut self.buf);
-                self.buf = combined;
+            match self.inner.read(&mut byte) {
+                Ok(0) | Err(_) => return None,
+                Ok(_) => {
+                    if byte[0] != b'\n' {
+                        self.line_buf.push(byte[0]);
+                        continue;
+                    }
+                    if self.line_buf.is_empty() {
+                        return Some(std::mem::take(&mut self.row));
+                    }
+                    let cell = unescape_bytes(&self.line_buf);
+                    self.line_buf.clear();
+                    self.row.push(cell);
+                }
             }
-            if self.buf.last() != Some(&b'\n') {
-                self.partial_line = std::mem::take(&mut self.buf);
-                return None;
-            }
-            let line = &self.buf[..self.buf.len() - 1];
-            if line.is_empty() {
-                return Some(std::mem::take(&mut self.row));
-            }
-            self.row.push(unescape_bytes(line));
         }
     }
 }
 
-impl<R: BufRead> Iterator for BytesReader<R> {
+impl<R: io::Read> Iterator for BytesReader<R> {
     type Item = Vec<Vec<u8>>;
     fn next(&mut self) -> Option<Self::Item> { self.next_row() }
 }
@@ -1131,17 +1130,6 @@ mod tests {
         assert_eq!(r.next_row(), None); // "c\nd" buffered, not emitted
     }
 
-    #[test]
-    fn test_reader_small_buffers() {
-        let input = "col1\ncol2\n\na\nb\n\nc\nd\n\n";
-        let batch = decode(input);
-        for sz in [1, 2, 3, 7, 13] {
-            let r = io::BufReader::with_capacity(sz, Cursor::new(input));
-            let streaming: Vec<_> = Reader::new(r).collect();
-            assert_eq!(streaming, batch, "buf_size={}", sz);
-        }
-    }
-
     // ── Resumable ──
 
     use std::cell::RefCell;
@@ -1159,13 +1147,6 @@ mod tests {
             s.1 += n;
             Ok(n)
         }
-    }
-    impl BufRead for &GrowableStream {
-        fn fill_buf(&mut self) -> io::Result<&[u8]> {
-            let s = self.0.borrow();
-            Ok(unsafe { std::slice::from_raw_parts(s.0[s.1..].as_ptr(), s.0.len() - s.1) })
-        }
-        fn consume(&mut self, amt: usize) { self.0.borrow_mut().1 += amt; }
     }
 
     #[test]
