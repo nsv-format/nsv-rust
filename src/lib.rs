@@ -470,15 +470,15 @@ pub fn check(input: &[u8]) -> Vec<Warning> {
 ///
 /// On EOF, returns `None` without discarding buffered state — calling
 /// `next_row()` again after more data arrives resumes where it left off.
-pub struct BytesReader<R> {
+pub struct Reader<R> {
     inner: R,
     line_buf: Vec<u8>,
     row: Vec<Vec<u8>>,
 }
 
-impl<R: io::Read> BytesReader<R> {
+impl<R: io::Read> Reader<R> {
     pub fn new(reader: R) -> Self {
-        BytesReader { inner: reader, line_buf: Vec::new(), row: Vec::new() }
+        Reader { inner: reader, line_buf: Vec::new(), row: Vec::new() }
     }
 
     pub fn next_row(&mut self) -> Option<Vec<Vec<u8>>> {
@@ -497,29 +497,35 @@ impl<R: io::Read> BytesReader<R> {
     }
 }
 
-impl<R: io::Read> Iterator for BytesReader<R> {
+impl<R: io::Read> Iterator for Reader<R> {
     type Item = Vec<Vec<u8>>;
     fn next(&mut self) -> Option<Self::Item> { self.next_row() }
 }
 
-/// Write a single complete row of raw byte cells.
-pub fn write_row_bytes<W: Write>(w: &mut W, row: &[&[u8]]) -> io::Result<()> {
-    for cell in row {
-        w.write_all(&escape_bytes(cell))?;
-        w.write_all(b"\n")?;
-    }
-    w.write_all(b"\n")
+/// Streaming NSV writer. Wraps any `W: Write` and writes one row at a time.
+///
+/// No internal buffering — wrap the inner writer in `BufWriter` if needed.
+pub struct Writer<W> {
+    inner: W,
 }
 
-/// Write a single complete row. Cells are escaped and `\n`-terminated;
-/// an extra `\n` terminates the row.
-pub fn write_row<W: Write, S: AsRef<str>>(w: &mut W, row: &[S]) -> io::Result<()> {
-    // Same operation — escape bytes are ASCII, str is valid UTF-8 ⊃ ASCII.
-    for cell in row {
-        w.write_all(&escape_bytes(cell.as_ref().as_bytes()))?;
-        w.write_all(b"\n")?;
+impl<W: Write> Writer<W> {
+    pub fn new(writer: W) -> Self {
+        Writer { inner: writer }
     }
-    w.write_all(b"\n")
+
+    /// Write a single complete row. Each cell is escaped and `\n`-terminated;
+    /// an extra `\n` terminates the row.
+    ///
+    /// Accepts any cell type that implements `AsRef<[u8]>`: `&[u8]`, `Vec<u8>`,
+    /// `&str`, `String`, etc.
+    pub fn write_row<C: AsRef<[u8]>>(&mut self, row: &[C]) -> io::Result<()> {
+        for cell in row {
+            self.inner.write_all(&escape_bytes(cell.as_ref()))?;
+            self.inner.write_all(b"\n")?;
+        }
+        self.inner.write_all(b"\n")
+    }
 }
 
 #[cfg(test)]
@@ -1067,14 +1073,14 @@ mod tests {
             b"\n\n\n\n",                             // only empty rows
             b"",
         ] {
-            let streaming: Vec<_> = BytesReader::new(Cursor::new(input)).collect();
+            let streaming: Vec<_> = Reader::new(Cursor::new(input)).collect();
             assert_eq!(streaming, decode_bytes(input), "input: {:?}", input);
         }
     }
 
     #[test]
     fn test_bytes_reader_incomplete_row_not_emitted() {
-        let mut r = BytesReader::new(Cursor::new(&b"a\nb\n\nc\nd"[..]));
+        let mut r = Reader::new(Cursor::new(&b"a\nb\n\nc\nd"[..]));
         assert_eq!(r.next_row().unwrap(), vec![b"a".to_vec(), b"b".to_vec()]);
         assert_eq!(r.next_row(), None); // "c\nd" buffered, not emitted
     }
@@ -1101,7 +1107,7 @@ mod tests {
     #[test]
     fn test_bytes_reader_resumable() {
         let s = GrowableStream::new();
-        let mut r = BytesReader::new(&s);
+        let mut r = Reader::new(&s);
 
         // Partial row, then complete it
         s.append(b"a\nb\n\nc\n");
@@ -1117,7 +1123,7 @@ mod tests {
         assert_eq!(r.next_row().unwrap(), vec![b"hello".to_vec()]);
     }
 
-    // ── BytesReader ──
+    // ── Reader ──
 
     #[test]
     fn test_bytes_reader() {
@@ -1125,47 +1131,51 @@ mod tests {
             &b"col1\ncol2\n\na\nb\n\nc\nd\n\n"[..],
             b"\n\n\n\n", b"", b"text\\\n\n",
         ] {
-            let streaming: Vec<_> = BytesReader::new(Cursor::new(input)).collect();
+            let streaming: Vec<_> = Reader::new(Cursor::new(input)).collect();
             assert_eq!(streaming, decode_bytes(input));
         }
         // Non-UTF-8 round-trip
         let orig = vec![vec![vec![0xC0, 0xE9], vec![0xFF, 0xFE]]];
         let enc = encode_bytes(&orig);
-        let dec: Vec<_> = BytesReader::new(Cursor::new(&enc[..])).collect();
+        let dec: Vec<_> = Reader::new(Cursor::new(&enc[..])).collect();
         assert_eq!(dec, orig);
     }
 
-    // ── write_row ──
+    // ── Writer ──
 
     #[test]
-    fn test_write_row() {
+    fn test_writer() {
         let mut buf = Vec::new();
-        write_row(&mut buf, &["hello", "world"]).unwrap();
+        let mut w = Writer::new(&mut buf);
+        w.write_row(&["hello", "world"]).unwrap();
         assert_eq!(buf, b"hello\nworld\n\n");
 
         buf.clear();
-        write_row(&mut buf, &["line1\nline2", "back\\slash"]).unwrap();
+        Writer::new(&mut buf).write_row(&["line1\nline2", "back\\slash"]).unwrap();
         assert_eq!(buf, b"line1\\nline2\nback\\\\slash\n\n");
 
         buf.clear();
-        write_row(&mut buf, &["", "", ""]).unwrap();
+        Writer::new(&mut buf).write_row(&["", "", ""]).unwrap();
         assert_eq!(buf, b"\\\n\\\n\\\n\n");
 
         buf.clear();
         let empty: &[&str] = &[];
-        write_row(&mut buf, empty).unwrap();
+        Writer::new(&mut buf).write_row(empty).unwrap();
         assert_eq!(buf, b"\n");
     }
 
     #[test]
-    fn test_write_row_matches_batch_encode() {
+    fn test_writer_matches_batch_encode() {
         let data = vec![
             vec!["a".to_string(), "b".to_string()],
             vec!["".to_string()],
             vec!["line\none".to_string(), "back\\slash".to_string()],
         ];
         let mut buf = Vec::new();
-        for row in &data { write_row(&mut buf, row).unwrap(); }
+        {
+            let mut w = Writer::new(&mut buf);
+            for row in &data { w.write_row(row).unwrap(); }
+        }
         assert_eq!(buf, encode(&data).as_bytes());
     }
 
@@ -1180,11 +1190,14 @@ mod tests {
             vec![],
         ];
         let mut buf = Vec::new();
-        for row in &original {
-            let refs: Vec<&[u8]> = row.iter().map(|c| c.as_slice()).collect();
-            write_row_bytes(&mut buf, &refs).unwrap();
+        {
+            let mut w = Writer::new(&mut buf);
+            for row in &original {
+                let refs: Vec<&[u8]> = row.iter().map(|c| c.as_slice()).collect();
+                w.write_row(&refs).unwrap();
+            }
         }
-        let decoded: Vec<_> = BytesReader::new(Cursor::new(&buf[..])).collect();
+        let decoded: Vec<_> = Reader::new(Cursor::new(&buf[..])).collect();
         assert_eq!(decoded, original);
     }
 }
