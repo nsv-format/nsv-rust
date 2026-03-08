@@ -502,36 +502,6 @@ impl<R: io::Read> Iterator for BytesReader<R> {
     fn next(&mut self) -> Option<Self::Item> { self.next_row() }
 }
 
-/// Streaming NSV reader. Wraps [`BytesReader`] and yields rows as `Vec<String>`.
-///
-/// ```
-/// use std::io::Cursor;
-/// let rows: Vec<Vec<String>> = nsv::Reader::new(Cursor::new("a\nb\n\n")).collect();
-/// assert_eq!(rows, vec![vec!["a".to_string(), "b".to_string()]]);
-/// ```
-pub struct Reader<R> {
-    inner: BytesReader<R>,
-}
-
-impl<R: io::Read> Reader<R> {
-    pub fn new(reader: R) -> Self {
-        Reader { inner: BytesReader::new(reader) }
-    }
-
-    pub fn next_row(&mut self) -> Option<Vec<String>> {
-        self.inner.next_row().map(|row| {
-            row.into_iter()
-                .map(|cell| unsafe { String::from_utf8_unchecked(cell) })
-                .collect()
-        })
-    }
-}
-
-impl<R: io::Read> Iterator for Reader<R> {
-    type Item = Vec<String>;
-    fn next(&mut self) -> Option<Self::Item> { self.next_row() }
-}
-
 /// Write a single complete row of raw byte cells.
 pub fn write_row_bytes<W: Write>(w: &mut W, row: &[&[u8]]) -> io::Result<()> {
     for cell in row {
@@ -1087,25 +1057,25 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn test_reader_matches_batch() {
+    fn test_bytes_reader_matches_batch() {
         for input in [
-            "a\nb\n\nc\nd\n\n",
-            "a\n\\\nb\n\n\\\nc\n\\\n\n",          // empty cells
-            "Line 1\\nLine 2\n\\\\\n\\\\n\n\n",    // escapes
-            "first\n\n\n\nsecond\n\n",              // consecutive empty rows
-            "\\\n\\\n\\\n\n",                       // only empty cells
-            "\n\n\n\n",                             // only empty rows
-            "",
+            &b"a\nb\n\nc\nd\n\n"[..],
+            b"a\n\\\nb\n\n\\\nc\n\\\n\n",          // empty cells
+            b"Line 1\\nLine 2\n\\\\\n\\\\n\n\n",    // escapes
+            b"first\n\n\n\nsecond\n\n",              // consecutive empty rows
+            b"\\\n\\\n\\\n\n",                       // only empty cells
+            b"\n\n\n\n",                             // only empty rows
+            b"",
         ] {
-            let streaming: Vec<_> = Reader::new(Cursor::new(input)).collect();
-            assert_eq!(streaming, decode(input), "input: {:?}", input);
+            let streaming: Vec<_> = BytesReader::new(Cursor::new(input)).collect();
+            assert_eq!(streaming, decode_bytes(input), "input: {:?}", input);
         }
     }
 
     #[test]
-    fn test_reader_incomplete_row_not_emitted() {
-        let mut r = Reader::new(Cursor::new("a\nb\n\nc\nd"));
-        assert_eq!(r.next_row().unwrap(), vec!["a", "b"]);
+    fn test_bytes_reader_incomplete_row_not_emitted() {
+        let mut r = BytesReader::new(Cursor::new(&b"a\nb\n\nc\nd"[..]));
+        assert_eq!(r.next_row().unwrap(), vec![b"a".to_vec(), b"b".to_vec()]);
         assert_eq!(r.next_row(), None); // "c\nd" buffered, not emitted
     }
 
@@ -1129,22 +1099,22 @@ mod tests {
     }
 
     #[test]
-    fn test_reader_resumable() {
+    fn test_bytes_reader_resumable() {
         let s = GrowableStream::new();
-        let mut r = Reader::new(&s);
+        let mut r = BytesReader::new(&s);
 
         // Partial row, then complete it
         s.append(b"a\nb\n\nc\n");
-        assert_eq!(r.next_row().unwrap(), vec!["a", "b"]);
+        assert_eq!(r.next_row().unwrap(), vec![b"a".to_vec(), b"b".to_vec()]);
         assert_eq!(r.next_row(), None);
         s.append(b"d\n\n");
-        assert_eq!(r.next_row().unwrap(), vec!["c", "d"]);
+        assert_eq!(r.next_row().unwrap(), vec![b"c".to_vec(), b"d".to_vec()]);
 
         // Mid-line split
         s.append(b"hel");
         assert_eq!(r.next_row(), None);
         s.append(b"lo\n\n");
-        assert_eq!(r.next_row().unwrap(), vec!["hello"]);
+        assert_eq!(r.next_row().unwrap(), vec![b"hello".to_vec()]);
     }
 
     // ── BytesReader ──
@@ -1203,15 +1173,18 @@ mod tests {
 
     #[test]
     fn test_roundtrip_streaming() {
-        let original: Vec<Vec<String>> = vec![
-            vec!["a".into(), "b".into()],
-            vec!["".into(), "val\\ue".into()],
-            vec!["multi\nline".into(), "normal".into()],
+        let original: Vec<Vec<Vec<u8>>> = vec![
+            vec![b"a".to_vec(), b"b".to_vec()],
+            vec![b"".to_vec(), b"val\\ue".to_vec()],
+            vec![b"multi\nline".to_vec(), b"normal".to_vec()],
             vec![],
         ];
         let mut buf = Vec::new();
-        for row in &original { write_row(&mut buf, row).unwrap(); }
-        let decoded: Vec<_> = Reader::new(Cursor::new(&buf[..])).collect();
+        for row in &original {
+            let refs: Vec<&[u8]> = row.iter().map(|c| c.as_slice()).collect();
+            write_row_bytes(&mut buf, &refs).unwrap();
+        }
+        let decoded: Vec<_> = BytesReader::new(Cursor::new(&buf[..])).collect();
         assert_eq!(decoded, original);
     }
 }
