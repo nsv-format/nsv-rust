@@ -476,7 +476,7 @@ pub fn check(input: &[u8]) -> Vec<Warning> {
 /// let rows: Vec<Vec<String>> = nsv::Reader::new(Cursor::new("a\nb\n\n")).collect();
 /// assert_eq!(rows, vec![vec!["a".to_string(), "b".to_string()]]);
 /// ```
-pub struct Reader<R: BufRead> {
+pub struct Reader<R> {
     inner: R,
     row: Vec<String>,
     buf: String,
@@ -515,7 +515,7 @@ impl<R: BufRead> Iterator for Reader<R> {
 }
 
 /// Like [`Reader`] but yields `Vec<Vec<u8>>` rows without assuming UTF-8.
-pub struct BytesReader<R: BufRead> {
+pub struct BytesReader<R> {
     inner: R,
     row: Vec<Vec<u8>>,
     buf: Vec<u8>,
