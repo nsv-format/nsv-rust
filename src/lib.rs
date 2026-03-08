@@ -21,7 +21,7 @@ pub mod util;
 use memchr::memmem;
 use rayon::prelude::*;
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -471,14 +471,18 @@ pub fn check(input: &[u8]) -> Vec<Warning> {
 /// On EOF, returns `None` without discarding buffered state — calling
 /// `next_row()` again after more data arrives resumes where it left off.
 pub struct Reader<R> {
-    inner: R,
+    inner: io::BufReader<R>,
     line_buf: Vec<u8>,
     row: Vec<Vec<u8>>,
 }
 
 impl<R: io::Read> Reader<R> {
     pub fn new(reader: R) -> Self {
-        Reader { inner: reader, line_buf: Vec::new(), row: Vec::new() }
+        Reader { inner: io::BufReader::new(reader), line_buf: Vec::new(), row: Vec::new() }
+    }
+
+    pub fn from_raw_reader(reader: R) -> Self {
+        Reader { inner: io::BufReader::with_capacity(0, reader), line_buf: Vec::new(), row: Vec::new() }
     }
 
     pub fn next_row(&mut self) -> Option<Vec<Vec<u8>>> {
