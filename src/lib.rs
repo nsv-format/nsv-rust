@@ -466,56 +466,10 @@ pub fn check(input: &[u8]) -> Vec<Warning> {
 
 // ── Streaming ────────────────────────────────────────────────────────
 
-/// Streaming NSV reader. Yields one complete row at a time.
+/// Streaming NSV reader. Yields one complete row of byte vectors at a time.
 ///
 /// On EOF, returns `None` without discarding buffered state — calling
 /// `next_row()` again after more data arrives resumes where it left off.
-///
-/// ```
-/// use std::io::Cursor;
-/// let rows: Vec<Vec<String>> = nsv::Reader::new(Cursor::new("a\nb\n\n")).collect();
-/// assert_eq!(rows, vec![vec!["a".to_string(), "b".to_string()]]);
-/// ```
-pub struct Reader<R> {
-    inner: R,
-    line_buf: Vec<u8>,
-    row: Vec<String>,
-}
-
-impl<R: io::Read> Reader<R> {
-    pub fn new(reader: R) -> Self {
-        Reader { inner: reader, line_buf: Vec::new(), row: Vec::new() }
-    }
-
-    pub fn next_row(&mut self) -> Option<Vec<String>> {
-        let mut byte = [0u8; 1];
-        loop {
-            match self.inner.read(&mut byte) {
-                Ok(0) | Err(_) => return None,
-                Ok(_) => {
-                    if byte[0] != b'\n' {
-                        self.line_buf.push(byte[0]);
-                        continue;
-                    }
-                    // Got a \n — line is complete
-                    if self.line_buf.is_empty() {
-                        return Some(std::mem::take(&mut self.row));
-                    }
-                    let cell = unescape_bytes(&self.line_buf);
-                    self.line_buf.clear();
-                    self.row.push(unsafe { String::from_utf8_unchecked(cell) });
-                }
-            }
-        }
-    }
-}
-
-impl<R: io::Read> Iterator for Reader<R> {
-    type Item = Vec<String>;
-    fn next(&mut self) -> Option<Self::Item> { self.next_row() }
-}
-
-/// Like [`Reader`] but yields `Vec<Vec<u8>>` rows without assuming UTF-8.
 pub struct BytesReader<R> {
     inner: R,
     line_buf: Vec<u8>,
@@ -532,17 +486,11 @@ impl<R: io::Read> BytesReader<R> {
         loop {
             match self.inner.read(&mut byte) {
                 Ok(0) | Err(_) => return None,
+                Ok(_) if byte[0] != b'\n' => self.line_buf.push(byte[0]),
+                Ok(_) if self.line_buf.is_empty() => return Some(std::mem::take(&mut self.row)),
                 Ok(_) => {
-                    if byte[0] != b'\n' {
-                        self.line_buf.push(byte[0]);
-                        continue;
-                    }
-                    if self.line_buf.is_empty() {
-                        return Some(std::mem::take(&mut self.row));
-                    }
-                    let cell = unescape_bytes(&self.line_buf);
+                    self.row.push(unescape_bytes(&self.line_buf));
                     self.line_buf.clear();
-                    self.row.push(cell);
                 }
             }
         }
@@ -554,20 +502,51 @@ impl<R: io::Read> Iterator for BytesReader<R> {
     fn next(&mut self) -> Option<Self::Item> { self.next_row() }
 }
 
-/// Write a single complete row. Each cell is escaped and `\n`-terminated;
-/// an extra `\n` terminates the row.
-pub fn write_row<W: Write, S: AsRef<str>>(w: &mut W, row: &[S]) -> io::Result<()> {
-    for cell in row {
-        w.write_all(&escape_bytes(cell.as_ref().as_bytes()))?;
-        w.write_all(b"\n")?;
+/// Streaming NSV reader. Wraps [`BytesReader`] and yields rows as `Vec<String>`.
+///
+/// ```
+/// use std::io::Cursor;
+/// let rows: Vec<Vec<String>> = nsv::Reader::new(Cursor::new("a\nb\n\n")).collect();
+/// assert_eq!(rows, vec![vec!["a".to_string(), "b".to_string()]]);
+/// ```
+pub struct Reader<R> {
+    inner: BytesReader<R>,
+}
+
+impl<R: io::Read> Reader<R> {
+    pub fn new(reader: R) -> Self {
+        Reader { inner: BytesReader::new(reader) }
     }
-    w.write_all(b"\n")
+
+    pub fn next_row(&mut self) -> Option<Vec<String>> {
+        self.inner.next_row().map(|row| {
+            row.into_iter()
+                .map(|cell| unsafe { String::from_utf8_unchecked(cell) })
+                .collect()
+        })
+    }
+}
+
+impl<R: io::Read> Iterator for Reader<R> {
+    type Item = Vec<String>;
+    fn next(&mut self) -> Option<Self::Item> { self.next_row() }
 }
 
 /// Write a single complete row of raw byte cells.
 pub fn write_row_bytes<W: Write>(w: &mut W, row: &[&[u8]]) -> io::Result<()> {
     for cell in row {
         w.write_all(&escape_bytes(cell))?;
+        w.write_all(b"\n")?;
+    }
+    w.write_all(b"\n")
+}
+
+/// Write a single complete row. Cells are escaped and `\n`-terminated;
+/// an extra `\n` terminates the row.
+pub fn write_row<W: Write, S: AsRef<str>>(w: &mut W, row: &[S]) -> io::Result<()> {
+    // Same operation — escape bytes are ASCII, str is valid UTF-8 ⊃ ASCII.
+    for cell in row {
+        w.write_all(&escape_bytes(cell.as_ref().as_bytes()))?;
         w.write_all(b"\n")?;
     }
     w.write_all(b"\n")
