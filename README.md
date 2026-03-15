@@ -96,14 +96,14 @@ Generic over `T: Clone + PartialEq` — works with strings, bytes, integers, any
 
 ### Streaming
 
-Resumable `Reader` and `Writer` for incremental I/O.
+Resumable `Reader` and `Writer` for incremental I/O — tailing files, sockets, pipes, etc.
+For finite/in-memory data, use `decode`/`encode` instead.
 
 ```rust
 use nsv::{Reader, Writer};
-use std::io::Cursor;
 
-// Reading — yields one row at a time
-let mut r = Reader::new(Cursor::new(b"a\nb\n\nc\nd\n\n"));
+// Reading — yields one row at a time, returns Ok(None) when no complete row is available
+let mut r = Reader::new(some_stream);
 while let Some(row) = r.next_row()? {
     // row: Vec<Vec<u8>>
 }
@@ -112,20 +112,12 @@ while let Some(row) = r.next_row()? {
 let _partial = r.partial_row();   // completed cells so far
 let _cell    = r.partial_cell();  // bytes of the cell being read (not yet unescaped)
 
-// Writing
-let mut buf = Vec::new();
-let mut w = Writer::new(&mut buf);
-w.write_row(&["hello", "world"])?;  // accepts &str, String, &[u8], Vec<u8>
-w.write_row(&[b"raw".as_slice()])?;
+// Writing — accepts &str, String, &[u8], Vec<u8>
+let mut w = Writer::new(some_sink);
+w.write_row(&["hello", "world"])?;
 
 // Recovering wrapped I/O
 let inner = w.into_inner();
-```
-
-The `Reader` also implements `Iterator<Item = io::Result<Vec<Vec<u8>>>>`, so for finite streams:
-
-```rust
-let rows: Result<Vec<_>, _> = Reader::new(Cursor::new(b"a\n\nb\n\n")).collect();
 ```
 
 ### Composition
