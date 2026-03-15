@@ -468,7 +468,7 @@ pub fn check(input: &[u8]) -> Vec<Warning> {
 
 /// Streaming NSV reader. Yields one complete row of byte vectors at a time.
 ///
-/// On EOF, returns `None` without discarding buffered state — calling
+/// On EOF, returns `Ok(None)` without discarding buffered state — calling
 /// `next_row()` again after more data arrives resumes where it left off.
 pub struct Reader<R> {
     inner: io::BufReader<R>,
@@ -485,13 +485,14 @@ impl<R: io::Read> Reader<R> {
         Reader { inner: reader, line_buf: Vec::new(), row: Vec::new() }
     }
 
-    pub fn next_row(&mut self) -> Option<Vec<Vec<u8>>> {
+    pub fn next_row(&mut self) -> io::Result<Option<Vec<Vec<u8>>>> {
         let mut byte = [0u8; 1];
         loop {
             match self.inner.read(&mut byte) {
-                Ok(0) | Err(_) => return None,
+                Ok(0) => return Ok(None),
+                Err(e) => return Err(e),
                 Ok(_) if byte[0] != b'\n' => self.line_buf.push(byte[0]),
-                Ok(_) if self.line_buf.is_empty() => return Some(std::mem::take(&mut self.row)),
+                Ok(_) if self.line_buf.is_empty() => return Ok(Some(std::mem::take(&mut self.row))),
                 Ok(_) => {
                     self.row.push(unescape_bytes(&self.line_buf));
                     self.line_buf.clear();
@@ -499,11 +500,28 @@ impl<R: io::Read> Reader<R> {
             }
         }
     }
+
+    /// Completed cells of the row currently being assembled.
+    pub fn partial_row(&self) -> &[Vec<u8>] {
+        &self.row
+    }
+
+    /// Bytes accumulated for the cell currently being read (not yet unescaped).
+    pub fn partial_cell(&self) -> &[u8] {
+        &self.line_buf
+    }
+
+    /// Recover the inner `BufReader`.
+    pub fn into_inner(self) -> io::BufReader<R> {
+        self.inner
+    }
 }
 
 impl<R: io::Read> Iterator for Reader<R> {
-    type Item = Vec<Vec<u8>>;
-    fn next(&mut self) -> Option<Self::Item> { self.next_row() }
+    type Item = io::Result<Vec<Vec<u8>>>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_row().transpose()
+    }
 }
 
 /// Streaming NSV writer. Wraps any `W: Write` and writes one row at a time.
@@ -529,6 +547,11 @@ impl<W: Write> Writer<W> {
             self.inner.write_all(b"\n")?;
         }
         self.inner.write_all(b"\n")
+    }
+
+    /// Recover the inner writer.
+    pub fn into_inner(self) -> W {
+        self.inner
     }
 }
 
@@ -1077,7 +1100,9 @@ mod tests {
             b"\n\n\n\n",                             // only empty rows
             b"",
         ] {
-            let streaming: Vec<_> = Reader::new(Cursor::new(input)).collect();
+            let streaming: Vec<_> = Reader::new(Cursor::new(input))
+                .map(|r| r.unwrap())
+                .collect();
             assert_eq!(streaming, decode_bytes(input), "input: {:?}", input);
         }
     }
@@ -1085,8 +1110,8 @@ mod tests {
     #[test]
     fn test_bytes_reader_incomplete_row_not_emitted() {
         let mut r = Reader::new(Cursor::new(&b"a\nb\n\nc\nd"[..]));
-        assert_eq!(r.next_row().unwrap(), vec![b"a".to_vec(), b"b".to_vec()]);
-        assert_eq!(r.next_row(), None); // "c\nd" buffered, not emitted
+        assert_eq!(r.next_row().unwrap(), Some(vec![b"a".to_vec(), b"b".to_vec()]));
+        assert_eq!(r.next_row().unwrap(), None); // "c\nd" buffered, not emitted
     }
 
     // ── Resumable ──
@@ -1115,16 +1140,16 @@ mod tests {
 
         // Partial row, then complete it
         s.append(b"a\nb\n\nc\n");
-        assert_eq!(r.next_row().unwrap(), vec![b"a".to_vec(), b"b".to_vec()]);
-        assert_eq!(r.next_row(), None);
+        assert_eq!(r.next_row().unwrap(), Some(vec![b"a".to_vec(), b"b".to_vec()]));
+        assert_eq!(r.next_row().unwrap(), None);
         s.append(b"d\n\n");
-        assert_eq!(r.next_row().unwrap(), vec![b"c".to_vec(), b"d".to_vec()]);
+        assert_eq!(r.next_row().unwrap(), Some(vec![b"c".to_vec(), b"d".to_vec()]));
 
         // Mid-line split
         s.append(b"hel");
-        assert_eq!(r.next_row(), None);
+        assert_eq!(r.next_row().unwrap(), None);
         s.append(b"lo\n\n");
-        assert_eq!(r.next_row().unwrap(), vec![b"hello".to_vec()]);
+        assert_eq!(r.next_row().unwrap(), Some(vec![b"hello".to_vec()]));
     }
 
     // ── Reader ──
@@ -1135,13 +1160,17 @@ mod tests {
             &b"col1\ncol2\n\na\nb\n\nc\nd\n\n"[..],
             b"\n\n\n\n", b"", b"text\\\n\n",
         ] {
-            let streaming: Vec<_> = Reader::new(Cursor::new(input)).collect();
+            let streaming: Vec<_> = Reader::new(Cursor::new(input))
+                .map(|r| r.unwrap())
+                .collect();
             assert_eq!(streaming, decode_bytes(input));
         }
         // Non-UTF-8 round-trip
         let orig = vec![vec![vec![0xC0, 0xE9], vec![0xFF, 0xFE]]];
         let enc = encode_bytes(&orig);
-        let dec: Vec<_> = Reader::new(Cursor::new(&enc[..])).collect();
+        let dec: Vec<_> = Reader::new(Cursor::new(&enc[..]))
+            .map(|r| r.unwrap())
+            .collect();
         assert_eq!(dec, orig);
     }
 
@@ -1201,7 +1230,9 @@ mod tests {
                 w.write_row(&refs).unwrap();
             }
         }
-        let decoded: Vec<_> = Reader::new(Cursor::new(&buf[..])).collect();
+        let decoded: Vec<_> = Reader::new(Cursor::new(&buf[..]))
+            .map(|r| r.unwrap())
+            .collect();
         assert_eq!(decoded, original);
     }
 }
