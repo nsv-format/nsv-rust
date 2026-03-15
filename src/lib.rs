@@ -466,6 +466,117 @@ pub fn check(input: &[u8]) -> Vec<Warning> {
 
 // ── Streaming ────────────────────────────────────────────────────────
 
+/// A single token from the cell-level streaming parser.
+///
+/// `Cell` carries the unescaped content of one cell.
+/// `EndOfRow` signals a row boundary (the empty-line separator).
+///
+/// This is the intermediate representation between line splitting and row
+/// grouping — the output of `unspill[Char, '\n']` + unescape, before
+/// `unspill[String, '']` groups things into rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Token {
+    /// Unescaped cell content.
+    Cell(Vec<u8>),
+    /// Row boundary (the empty-line separator).
+    EndOfRow,
+}
+
+/// Streaming cell-level NSV reader. Yields one `Token` at a time.
+///
+/// This is the primitive layer: the row-level `Reader` is equivalent to
+/// "collect `Cell` tokens until `EndOfRow`" on top of this.
+///
+/// **Incomplete rows on EOF:** cells yielded before an unexpected EOF belong
+/// to an incomplete row. The caller decides whether to use or discard them —
+/// no `StartOfRow` framing is added. Callers processing cell-by-cell (e.g.
+/// adjacency lists) typically want to act eagerly anyway.
+///
+/// **Resumable:** on EOF, buffered state is preserved. Calling `next_token()`
+/// again after more data arrives resumes where it left off.
+pub struct CellReader<R> {
+    inner: io::BufReader<R>,
+    buf: Vec<u8>,
+}
+
+impl<R: io::Read> CellReader<R> {
+    pub fn new(reader: R) -> Self {
+        Self::from_buf_reader(io::BufReader::new(reader))
+    }
+
+    pub fn from_buf_reader(reader: io::BufReader<R>) -> Self {
+        CellReader { inner: reader, buf: Vec::new() }
+    }
+
+    /// Read the next token from the stream.
+    ///
+    /// Returns `Ok(Some(Token::Cell(...)))` for a cell,
+    /// `Ok(Some(Token::EndOfRow))` for a row boundary,
+    /// or `Ok(None)` on EOF.
+    pub fn next_token(&mut self) -> io::Result<Option<Token>> {
+        let mut byte = [0u8; 1];
+        loop {
+            match self.inner.read(&mut byte) {
+                Ok(0) => return Ok(None),
+                Err(e) => return Err(e),
+                Ok(_) if byte[0] != b'\n' => self.buf.push(byte[0]),
+                Ok(_) if self.buf.is_empty() => return Ok(Some(Token::EndOfRow)),
+                Ok(_) => {
+                    let cell = unescape_bytes(&self.buf);
+                    self.buf.clear();
+                    return Ok(Some(Token::Cell(cell)));
+                }
+            }
+        }
+    }
+
+    /// Bytes accumulated for the cell currently being read (not yet unescaped).
+    pub fn partial_cell(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// Recover the inner `BufReader`.
+    pub fn into_inner(self) -> io::BufReader<R> {
+        self.inner
+    }
+}
+
+impl<R: io::Read> Iterator for CellReader<R> {
+    type Item = io::Result<Token>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_token().transpose()
+    }
+}
+
+/// Streaming cell-level NSV writer. Writes one cell or row boundary at a time.
+///
+/// No internal buffering — wrap the inner writer in `BufWriter` if needed.
+pub struct CellWriter<W> {
+    inner: W,
+}
+
+impl<W: Write> CellWriter<W> {
+    pub fn new(writer: W) -> Self {
+        CellWriter { inner: writer }
+    }
+
+    /// Write a single cell (escaped and `\n`-terminated).
+    pub fn write_cell<C: AsRef<[u8]>>(&mut self, cell: C) -> io::Result<()> {
+        self.inner.write_all(&escape_bytes(cell.as_ref()))?;
+        self.inner.write_all(b"\n")
+    }
+
+    /// Write a row boundary (an extra `\n`).
+    pub fn end_row(&mut self) -> io::Result<()> {
+        self.inner.write_all(b"\n")
+    }
+
+    /// Recover the inner writer.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
 /// Streaming NSV reader. Yields one complete row of byte vectors at a time.
 ///
 /// On EOF, returns `Ok(None)` without discarding buffered state — calling
@@ -1234,5 +1345,273 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(decoded, original);
+    }
+
+    // ── Cell-level streaming tests ──
+
+    #[test]
+    fn test_cell_reader_basic() {
+        let input = b"a\nb\n\nc\nd\n\n";
+        let tokens: Vec<_> = CellReader::new(Cursor::new(&input[..]))
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Cell(b"a".to_vec()),
+                Token::Cell(b"b".to_vec()),
+                Token::EndOfRow,
+                Token::Cell(b"c".to_vec()),
+                Token::Cell(b"d".to_vec()),
+                Token::EndOfRow,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cell_reader_empty_rows() {
+        let input = b"first\n\n\n\nsecond\n\n";
+        let tokens: Vec<_> = CellReader::new(Cursor::new(&input[..]))
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Cell(b"first".to_vec()),
+                Token::EndOfRow,
+                Token::EndOfRow,
+                Token::EndOfRow,
+                Token::Cell(b"second".to_vec()),
+                Token::EndOfRow,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cell_reader_escapes() {
+        let input = b"Line 1\\nLine 2\n\\\\\n\\\n\n";
+        let tokens: Vec<_> = CellReader::new(Cursor::new(&input[..]))
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Cell(b"Line 1\nLine 2".to_vec()),
+                Token::Cell(b"\\".to_vec()),
+                Token::Cell(b"".to_vec()), // lone backslash = empty cell
+                Token::EndOfRow,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cell_reader_empty_input() {
+        let tokens: Vec<_> = CellReader::new(Cursor::new(&b""[..]))
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn test_cell_reader_only_empty_rows() {
+        let input = b"\n\n\n\n";
+        let tokens: Vec<_> = CellReader::new(Cursor::new(&input[..]))
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![Token::EndOfRow, Token::EndOfRow, Token::EndOfRow, Token::EndOfRow]
+        );
+    }
+
+    #[test]
+    fn test_cell_reader_incomplete_row_on_eof() {
+        // "c\nd" has no trailing \n\n — cells are yielded but no EndOfRow
+        let input = b"a\nb\n\nc\nd";
+        let tokens: Vec<_> = CellReader::new(Cursor::new(&input[..]))
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Cell(b"a".to_vec()),
+                Token::Cell(b"b".to_vec()),
+                Token::EndOfRow,
+                Token::Cell(b"c".to_vec()),
+                // "d" is buffered but no \n seen, so not emitted
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cell_reader_resumable() {
+        let s = GrowableStream::new();
+        let mut r = CellReader::new(&s);
+
+        s.append(b"a\nb\n\nc\n");
+        assert_eq!(r.next_token().unwrap(), Some(Token::Cell(b"a".to_vec())));
+        assert_eq!(r.next_token().unwrap(), Some(Token::Cell(b"b".to_vec())));
+        assert_eq!(r.next_token().unwrap(), Some(Token::EndOfRow));
+        assert_eq!(r.next_token().unwrap(), Some(Token::Cell(b"c".to_vec())));
+        assert_eq!(r.next_token().unwrap(), None); // EOF
+
+        s.append(b"d\n\n");
+        assert_eq!(r.next_token().unwrap(), Some(Token::Cell(b"d".to_vec())));
+        assert_eq!(r.next_token().unwrap(), Some(Token::EndOfRow));
+
+        // Mid-cell resume
+        s.append(b"hel");
+        assert_eq!(r.next_token().unwrap(), None);
+        s.append(b"lo\n\n");
+        assert_eq!(r.next_token().unwrap(), Some(Token::Cell(b"hello".to_vec())));
+        assert_eq!(r.next_token().unwrap(), Some(Token::EndOfRow));
+    }
+
+    #[test]
+    fn test_cell_reader_matches_row_reader() {
+        // Collecting Cell tokens until EndOfRow should produce the same rows
+        // as the row-level Reader.
+        for input in [
+            &b"a\nb\n\nc\nd\n\n"[..],
+            b"a\n\\\nb\n\n\\\nc\n\\\n\n",
+            b"Line 1\\nLine 2\n\\\\\n\\\\n\n\n",
+            b"first\n\n\n\nsecond\n\n",
+            b"\\\n\\\n\\\n\n",
+            b"\n\n\n\n",
+            b"",
+        ] {
+            let row_result: Vec<_> = Reader::new(Cursor::new(input))
+                .map(|r| r.unwrap())
+                .collect();
+
+            // Reconstruct rows from cell tokens
+            let mut cell_rows: Vec<Vec<Vec<u8>>> = Vec::new();
+            let mut current_row: Vec<Vec<u8>> = Vec::new();
+            for token in CellReader::new(Cursor::new(input)).map(|r| r.unwrap()) {
+                match token {
+                    Token::Cell(c) => current_row.push(c),
+                    Token::EndOfRow => {
+                        cell_rows.push(std::mem::take(&mut current_row));
+                    }
+                }
+            }
+            // Don't push incomplete row — matches Reader behavior
+
+            assert_eq!(cell_rows, row_result, "mismatch for input: {:?}", input);
+        }
+    }
+
+    #[test]
+    fn test_cell_reader_non_utf8() {
+        let orig = vec![vec![vec![0xC0, 0xE9], vec![0xFF, 0xFE]]];
+        let enc = encode_bytes(&orig);
+        let tokens: Vec<_> = CellReader::new(Cursor::new(&enc[..]))
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Cell(vec![0xC0, 0xE9]),
+                Token::Cell(vec![0xFF, 0xFE]),
+                Token::EndOfRow,
+            ]
+        );
+    }
+
+    // ── CellWriter tests ──
+
+    #[test]
+    fn test_cell_writer_basic() {
+        let mut buf = Vec::new();
+        {
+            let mut w = CellWriter::new(&mut buf);
+            w.write_cell("hello").unwrap();
+            w.write_cell("world").unwrap();
+            w.end_row().unwrap();
+        }
+        assert_eq!(buf, b"hello\nworld\n\n");
+    }
+
+    #[test]
+    fn test_cell_writer_escapes() {
+        let mut buf = Vec::new();
+        {
+            let mut w = CellWriter::new(&mut buf);
+            w.write_cell("line1\nline2").unwrap();
+            w.write_cell("back\\slash").unwrap();
+            w.end_row().unwrap();
+        }
+        assert_eq!(buf, b"line1\\nline2\nback\\\\slash\n\n");
+    }
+
+    #[test]
+    fn test_cell_writer_empty_cells() {
+        let mut buf = Vec::new();
+        {
+            let mut w = CellWriter::new(&mut buf);
+            w.write_cell(b"" as &[u8]).unwrap();
+            w.write_cell(b"" as &[u8]).unwrap();
+            w.end_row().unwrap();
+        }
+        assert_eq!(buf, b"\\\n\\\n\n");
+    }
+
+    #[test]
+    fn test_cell_writer_matches_row_writer() {
+        let data: Vec<Vec<&str>> = vec![
+            vec!["a", "b"],
+            vec![""],
+            vec!["line\none", "back\\slash"],
+        ];
+        let mut row_buf = Vec::new();
+        {
+            let mut w = Writer::new(&mut row_buf);
+            for row in &data {
+                w.write_row(row.as_slice()).unwrap();
+            }
+        }
+        let mut cell_buf = Vec::new();
+        {
+            let mut w = CellWriter::new(&mut cell_buf);
+            for row in &data {
+                for cell in row {
+                    w.write_cell(cell).unwrap();
+                }
+                w.end_row().unwrap();
+            }
+        }
+        assert_eq!(cell_buf, row_buf);
+    }
+
+    #[test]
+    fn test_cell_roundtrip() {
+        let original: Vec<Vec<Vec<u8>>> = vec![
+            vec![b"a".to_vec(), b"b".to_vec()],
+            vec![b"".to_vec(), b"val\\ue".to_vec()],
+            vec![b"multi\nline".to_vec(), b"normal".to_vec()],
+            vec![],
+        ];
+        let mut buf = Vec::new();
+        {
+            let mut w = CellWriter::new(&mut buf);
+            for row in &original {
+                for cell in row {
+                    w.write_cell(cell.as_slice()).unwrap();
+                }
+                w.end_row().unwrap();
+            }
+        }
+        // Read back with CellReader and reconstruct rows
+        let mut rows: Vec<Vec<Vec<u8>>> = Vec::new();
+        let mut current: Vec<Vec<u8>> = Vec::new();
+        for token in CellReader::new(Cursor::new(&buf[..])).map(|r| r.unwrap()) {
+            match token {
+                Token::Cell(c) => current.push(c),
+                Token::EndOfRow => {
+                    rows.push(std::mem::take(&mut current));
+                }
+            }
+        }
+        assert_eq!(rows, original);
     }
 }
