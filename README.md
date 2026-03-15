@@ -94,6 +94,40 @@ let structured = unspill(&flat, &"");
 
 Generic over `T: Clone + PartialEq` — works with strings, bytes, integers, anything.
 
+### Streaming
+
+Resumable `Reader` and `Writer` for incremental I/O.
+
+```rust
+use nsv::{Reader, Writer};
+use std::io::Cursor;
+
+// Reading — yields one row at a time
+let mut r = Reader::new(Cursor::new(b"a\nb\n\nc\nd\n\n"));
+while let Some(row) = r.next_row()? {
+    // row: Vec<Vec<u8>>
+}
+
+// Peeking at buffered state (useful when the source may have more data later)
+let _partial = r.partial_row();   // completed cells so far
+let _cell    = r.partial_cell();  // bytes of the cell being read (not yet unescaped)
+
+// Writing
+let mut buf = Vec::new();
+let mut w = Writer::new(&mut buf);
+w.write_row(&["hello", "world"])?;  // accepts &str, String, &[u8], Vec<u8>
+w.write_row(&[b"raw".as_slice()])?;
+
+// Recovering wrapped I/O
+let inner = w.into_inner();
+```
+
+The `Reader` also implements `Iterator<Item = io::Result<Vec<Vec<u8>>>>`, so for finite streams:
+
+```rust
+let rows: Result<Vec<_>, _> = Reader::new(Cursor::new(b"a\n\nb\n\n")).collect();
+```
+
 ### Composition
 
 `nsv::util` also exposes the algebraic decomposition of encode/decode:
@@ -140,6 +174,17 @@ assert_eq!(nsv::encode(&data), encoded);
 | Function | Signature |
 |----------|-----------|
 | `check` | `(&[u8]) -> Vec<Warning>` |
+
+### Streaming
+
+| Type | Method | Signature |
+|------|--------|-----------|
+| `Reader<R>` | `next_row` | `(&mut self) -> io::Result<Option<Vec<Vec<u8>>>>` |
+| | `partial_row` | `(&self) -> &[Vec<u8>]` |
+| | `partial_cell` | `(&self) -> &[u8]` |
+| | `into_inner` | `(self) -> BufReader<R>` |
+| `Writer<W>` | `write_row` | `(&mut self, &[C: AsRef<[u8]>]) -> io::Result<()>` |
+| | `into_inner` | `(self) -> W` |
 
 ### Util (`nsv::util`)
 
