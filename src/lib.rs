@@ -21,6 +21,7 @@ pub mod util;
 use memchr::memmem;
 use rayon::prelude::*;
 
+use std::borrow::Cow;
 use std::io::{self, Read, Write};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -38,16 +39,19 @@ pub fn decode(s: &str) -> Vec<Vec<String>> {
                     // SAFETY: input was &str (valid UTF-8). NSV splitting and unescaping
                     // only operate on ASCII bytes (0x0A, 0x5C, 0x6E), which cannot split
                     // a multi-byte UTF-8 sequence. Each resulting cell is therefore valid UTF-8.
-                    unsafe { String::from_utf8_unchecked(cell) }
+                    unsafe { String::from_utf8_unchecked(cell.into_owned()) }
                 })
                 .collect()
         })
         .collect()
 }
 
-/// Decode raw bytes into a seqseq of byte vectors.
+/// Decode raw bytes into a seqseq of byte slices.
 /// No encoding assumption — works with any ASCII-compatible encoding.
-pub fn decode_bytes(input: &[u8]) -> Vec<Vec<Vec<u8>>> {
+///
+/// Cells are returned as `Cow<[u8]>` — borrowed when no unescaping was needed
+/// (zero-copy), owned when the cell contained escape sequences.
+pub fn decode_bytes<'a>(input: &'a [u8]) -> Vec<Vec<Cow<'a, [u8]>>> {
     if input.is_empty() {
         return Vec::new();
     }
@@ -61,9 +65,9 @@ pub fn decode_bytes(input: &[u8]) -> Vec<Vec<Vec<u8>>> {
 }
 
 /// Sequential implementation for small inputs (byte-level).
-fn decode_bytes_sequential(input: &[u8]) -> Vec<Vec<Vec<u8>>> {
+fn decode_bytes_sequential<'a>(input: &'a [u8]) -> Vec<Vec<Cow<'a, [u8]>>> {
     let mut data = Vec::new();
-    let mut row: Vec<Vec<u8>> = Vec::new();
+    let mut row: Vec<Cow<'a, [u8]>> = Vec::new();
     let mut start = 0;
 
     for (pos, &b) in input.iter().enumerate() {
@@ -94,7 +98,7 @@ fn decode_bytes_sequential(input: &[u8]) -> Vec<Vec<Vec<u8>>> {
 /// Splits the input into N equal-sized byte chunks (one per core), aligns each
 /// split point to the nearest `\n\n` row boundary, and parses each chunk
 /// independently. The sequential phase is O(N), not O(input_len).
-fn decode_bytes_parallel(input: &[u8]) -> Vec<Vec<Vec<u8>>> {
+fn decode_bytes_parallel<'a>(input: &'a [u8]) -> Vec<Vec<Cow<'a, [u8]>>> {
     let num_threads = rayon::current_num_threads();
     let chunk_size = input.len() / num_threads;
 
@@ -128,7 +132,7 @@ fn decode_bytes_parallel(input: &[u8]) -> Vec<Vec<Vec<u8>>> {
     // (or byte 0), so the sequential parser produces correct results per chunk.
     let chunks: Vec<&[u8]> = splits.windows(2).map(|w| &input[w[0]..w[1]]).collect();
 
-    let chunk_results: Vec<Vec<Vec<Vec<u8>>>> = chunks
+    let chunk_results: Vec<Vec<Vec<Cow<'a, [u8]>>>> = chunks
         .par_iter()
         .map(|chunk| decode_bytes_sequential(chunk))
         .collect();
@@ -142,9 +146,16 @@ fn decode_bytes_parallel(input: &[u8]) -> Vec<Vec<Vec<u8>>> {
 }
 
 /// Unescape a single NSV cell.
-pub fn unescape(s: &str) -> String {
-    // SAFETY: unescape only removes/replaces ASCII bytes — preserves UTF-8 validity.
-    unsafe { String::from_utf8_unchecked(unescape_bytes(s.as_bytes())) }
+///
+/// Returns `Cow::Borrowed` when no unescaping is needed.
+pub fn unescape(s: &str) -> Cow<'_, str> {
+    match unescape_bytes(s.as_bytes()) {
+        // SAFETY: input was &str (valid UTF-8). Borrowed means no transformation,
+        // so the result is the same valid UTF-8 slice.
+        Cow::Borrowed(b) => Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(b) }),
+        // SAFETY: unescape only removes/replaces ASCII bytes — preserves UTF-8 validity.
+        Cow::Owned(v) => Cow::Owned(unsafe { String::from_utf8_unchecked(v) }),
+    }
 }
 
 /// Unescape a single raw cell (byte-level).
@@ -152,13 +163,15 @@ pub fn unescape(s: &str) -> String {
 /// Interprets `\` as the empty cell token (returns empty vec).
 /// `\\` → `\`, `\n` → LF. Unrecognized sequences pass through.
 /// Dangling backslash at end is stripped.
-pub fn unescape_bytes(s: &[u8]) -> Vec<u8> {
+///
+/// Returns `Cow::Borrowed` when no unescaping is needed (no backslash present).
+pub fn unescape_bytes(s: &[u8]) -> Cow<'_, [u8]> {
     if s == b"\\" {
-        return Vec::new();
+        return Cow::Owned(Vec::new());
     }
 
     if !s.contains(&b'\\') {
-        return s.to_vec();
+        return Cow::Borrowed(s);
     }
 
     let mut out = Vec::with_capacity(s.len());
@@ -182,22 +195,31 @@ pub fn unescape_bytes(s: &[u8]) -> Vec<u8> {
         }
     }
 
-    out
+    Cow::Owned(out)
 }
 
 /// Escape a single NSV cell.
-pub fn escape(s: &str) -> String {
-    // SAFETY: escape only inserts ASCII bytes (\, n) — preserves UTF-8 validity.
-    unsafe { String::from_utf8_unchecked(escape_bytes(s.as_bytes())) }
+///
+/// Returns `Cow::Borrowed` when no escaping is needed.
+pub fn escape(s: &str) -> Cow<'_, str> {
+    match escape_bytes(s.as_bytes()) {
+        // SAFETY: input was &str (valid UTF-8). Borrowed means no transformation,
+        // so the result is the same valid UTF-8 slice.
+        Cow::Borrowed(b) => Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(b) }),
+        // SAFETY: escape only inserts ASCII bytes (\, n) — preserves UTF-8 validity.
+        Cow::Owned(v) => Cow::Owned(unsafe { String::from_utf8_unchecked(v) }),
+    }
 }
 
 /// Escape a single raw cell (byte-level).
 ///
 /// Empty input → `\` (empty cell token).
 /// `\` → `\\`, LF → `\n`.
-pub fn escape_bytes(s: &[u8]) -> Vec<u8> {
+///
+/// Returns `Cow::Borrowed` when no escaping is needed (non-empty, no `\` or LF).
+pub fn escape_bytes(s: &[u8]) -> Cow<'_, [u8]> {
     if s.is_empty() {
-        return b"\\".to_vec();
+        return Cow::Owned(b"\\".to_vec());
     }
 
     if s.contains(&b'\n') || s.contains(&b'\\') {
@@ -215,9 +237,9 @@ pub fn escape_bytes(s: &[u8]) -> Vec<u8> {
                 _ => out.push(b),
             }
         }
-        out
+        Cow::Owned(out)
     } else {
-        s.to_vec()
+        Cow::Borrowed(s)
     }
 }
 
@@ -243,7 +265,9 @@ fn build_col_map(columns: &[usize]) -> (Vec<usize>, usize) {
 /// Single-pass: scans for cell/row boundaries and directly unescapes
 /// only the cells in projected columns.  No intermediate structural index.
 /// Each inner vec has exactly `columns.len()` entries (same order as `columns`).
-pub fn decode_bytes_projected(input: &[u8], columns: &[usize]) -> Vec<Vec<Vec<u8>>> {
+///
+/// Cells are returned as `Cow<[u8]>` — borrowed when no unescaping was needed.
+pub fn decode_bytes_projected<'a>(input: &'a [u8], columns: &[usize]) -> Vec<Vec<Cow<'a, [u8]>>> {
     if input.is_empty() || columns.is_empty() {
         return Vec::new();
     }
@@ -256,11 +280,11 @@ pub fn decode_bytes_projected(input: &[u8], columns: &[usize]) -> Vec<Vec<Vec<u8
 }
 
 /// Sequential single-pass projected decode.
-fn decode_projected_sequential(input: &[u8], columns: &[usize]) -> Vec<Vec<Vec<u8>>> {
+fn decode_projected_sequential<'a>(input: &'a [u8], columns: &[usize]) -> Vec<Vec<Cow<'a, [u8]>>> {
     let (col_map, max_col) = build_col_map(columns);
     let stride = columns.len();
-    let mut data: Vec<Vec<Vec<u8>>> = Vec::new();
-    let mut row: Vec<Vec<u8>> = vec![Vec::new(); stride];
+    let mut data: Vec<Vec<Cow<'a, [u8]>>> = Vec::new();
+    let mut row: Vec<Cow<'a, [u8]>> = vec![Cow::Borrowed(b""); stride];
     let mut col_idx: usize = 0;
     let mut start = 0;
     let mut row_has_cells = false;
@@ -280,7 +304,7 @@ fn decode_projected_sequential(input: &[u8], columns: &[usize]) -> Vec<Vec<Vec<u
             } else {
                 if row_has_cells || !data.is_empty() || col_idx == 0 {
                     data.push(row);
-                    row = vec![Vec::new(); stride];
+                    row = vec![Cow::Borrowed(b""); stride];
                 }
                 col_idx = 0;
                 row_has_cells = false;
@@ -308,7 +332,7 @@ fn decode_projected_sequential(input: &[u8], columns: &[usize]) -> Vec<Vec<Vec<u
 }
 
 /// Parallel single-pass projected decode.
-fn decode_projected_parallel(input: &[u8], columns: &[usize]) -> Vec<Vec<Vec<u8>>> {
+fn decode_projected_parallel<'a>(input: &'a [u8], columns: &[usize]) -> Vec<Vec<Cow<'a, [u8]>>> {
     let num_threads = rayon::current_num_threads();
     let chunk_size = input.len() / num_threads;
 
@@ -338,7 +362,7 @@ fn decode_projected_parallel(input: &[u8], columns: &[usize]) -> Vec<Vec<Vec<u8>
 
     let chunks: Vec<&[u8]> = splits.windows(2).map(|w| &input[w[0]..w[1]]).collect();
 
-    let chunk_results: Vec<Vec<Vec<Vec<u8>>>> = chunks
+    let chunk_results: Vec<Vec<Vec<Cow<'a, [u8]>>>> = chunks
         .par_iter()
         .map(|chunk| decode_projected_sequential(chunk, columns))
         .collect();
@@ -494,7 +518,7 @@ impl<R: io::Read> Reader<R> {
                 Ok(_) if byte[0] != b'\n' => self.line_buf.push(byte[0]),
                 Ok(_) if self.line_buf.is_empty() => return Ok(Some(std::mem::take(&mut self.row))),
                 Ok(_) => {
-                    self.row.push(unescape_bytes(&self.line_buf));
+                    self.row.push(unescape_bytes(&self.line_buf).into_owned());
                     self.line_buf.clear();
                 }
             }
@@ -558,6 +582,13 @@ impl<W: Write> Writer<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Convert Cow cells to owned for comparison with pre-built Vec<Vec<Vec<u8>>> data.
+    fn owned(rows: Vec<Vec<Cow<[u8]>>>) -> Vec<Vec<Vec<u8>>> {
+        rows.into_iter()
+            .map(|row| row.into_iter().map(|c| c.into_owned()).collect())
+            .collect()
+    }
 
     #[test]
     fn test_simple_table() {
@@ -772,7 +803,7 @@ mod tests {
         ];
 
         let encoded = encode_bytes(&original);
-        let decoded = decode_bytes(&encoded);
+        let decoded = owned(decode_bytes(&encoded));
         assert_eq!(original, decoded);
     }
 
@@ -784,7 +815,7 @@ mod tests {
         let original: Vec<Vec<Vec<u8>>> = vec![vec![cell1.clone(), cell2.clone()]];
 
         let encoded = encode_bytes(&original);
-        let decoded = decode_bytes(&encoded);
+        let decoded = owned(decode_bytes(&encoded));
         assert_eq!(original, decoded);
     }
 
@@ -797,7 +828,7 @@ mod tests {
         ];
 
         let encoded = encode_bytes(&original);
-        let decoded = decode_bytes(&encoded);
+        let decoded = owned(decode_bytes(&encoded));
         assert_eq!(original, decoded);
     }
 
@@ -810,7 +841,7 @@ mod tests {
         let original = vec![vec![cell.clone()]];
 
         let encoded = encode_bytes(&original);
-        let decoded = decode_bytes(&encoded);
+        let decoded = owned(decode_bytes(&encoded));
         assert_eq!(original, decoded);
     }
 
@@ -835,7 +866,7 @@ mod tests {
                 .into_iter()
                 .map(|row| {
                     row.into_iter()
-                        .map(|cell| String::from_utf8(cell).unwrap())
+                        .map(|cell| String::from_utf8(cell.into_owned()).unwrap())
                         .collect()
                 })
                 .collect();
@@ -859,7 +890,7 @@ mod tests {
         let encoded = encode_bytes(&large_data);
         assert!(encoded.len() > PARALLEL_THRESHOLD);
 
-        let decoded = decode_bytes(&encoded);
+        let decoded = owned(decode_bytes(&encoded));
         assert_eq!(large_data, decoded);
     }
 
@@ -1017,7 +1048,7 @@ mod tests {
     #[test]
     fn test_project_subset() {
         let nsv = b"c0\nc1\nc2\nc3\n\na\nb\nc\nd\n\ne\nf\ng\nh\n\n";
-        let projected = decode_bytes_projected(nsv, &[0, 2]);
+        let projected = owned(decode_bytes_projected(nsv, &[0, 2]));
         assert_eq!(projected.len(), 3);
         assert_eq!(projected[0], vec![b"c0".to_vec(), b"c2".to_vec()]);
         assert_eq!(projected[1], vec![b"a".to_vec(), b"c".to_vec()]);
@@ -1027,7 +1058,7 @@ mod tests {
     #[test]
     fn test_project_single_column() {
         let nsv = b"name\nage\nsalary\n\nAlice\n30\n50000\n\nBob\n25\n75000\n\n";
-        let projected = decode_bytes_projected(nsv, &[1]);
+        let projected = owned(decode_bytes_projected(nsv, &[1]));
         assert_eq!(projected.len(), 3);
         assert_eq!(projected[0], vec![b"age".to_vec()]);
         assert_eq!(projected[1], vec![b"30".to_vec()]);
@@ -1037,7 +1068,7 @@ mod tests {
     #[test]
     fn test_project_reorder() {
         let nsv = b"a\nb\nc\n\n1\n2\n3\n\n";
-        let projected = decode_bytes_projected(nsv, &[2, 0]);
+        let projected = owned(decode_bytes_projected(nsv, &[2, 0]));
         assert_eq!(projected[0], vec![b"c".to_vec(), b"a".to_vec()]);
         assert_eq!(projected[1], vec![b"3".to_vec(), b"1".to_vec()]);
     }
@@ -1045,15 +1076,15 @@ mod tests {
     #[test]
     fn test_project_out_of_range() {
         let nsv = b"a\nb\n\n";
-        let projected = decode_bytes_projected(nsv, &[0, 5]);
+        let projected = owned(decode_bytes_projected(nsv, &[0, 5]));
         assert_eq!(projected[0], vec![b"a".to_vec(), b"".to_vec()]);
     }
 
     #[test]
     fn test_projected_matches_full() {
         let nsv = b"c0\nc1\nc2\n\na\nb\nc\n\n";
-        let full = decode_bytes(nsv);
-        let projected = decode_bytes_projected(nsv, &[0, 1, 2]);
+        let full = owned(decode_bytes(nsv));
+        let projected = owned(decode_bytes_projected(nsv, &[0, 1, 2]));
         assert_eq!(projected, full);
     }
 
@@ -1075,13 +1106,13 @@ mod tests {
         assert_eq!(projected.len(), data.len());
         for (ri, row) in data.iter().enumerate() {
             assert_eq!(
-                String::from_utf8(projected[ri][0].clone()).unwrap(),
+                String::from_utf8(projected[ri][0].to_vec()).unwrap(),
                 row[2]
             );
         }
 
-        let full = decode_bytes(encoded_bytes);
-        let projected_all = decode_bytes_projected(encoded_bytes, &[0, 1, 2]);
+        let full = owned(decode_bytes(encoded_bytes));
+        let projected_all = owned(decode_bytes_projected(encoded_bytes, &[0, 1, 2]));
         assert_eq!(projected_all, full);
     }
 
@@ -1103,7 +1134,7 @@ mod tests {
             let streaming: Vec<_> = Reader::new(Cursor::new(input))
                 .map(|r| r.unwrap())
                 .collect();
-            assert_eq!(streaming, decode_bytes(input), "input: {:?}", input);
+            assert_eq!(streaming, owned(decode_bytes(input)), "input: {:?}", input);
         }
     }
 
@@ -1163,7 +1194,7 @@ mod tests {
             let streaming: Vec<_> = Reader::new(Cursor::new(input))
                 .map(|r| r.unwrap())
                 .collect();
-            assert_eq!(streaming, decode_bytes(input));
+            assert_eq!(streaming, owned(decode_bytes(input)));
         }
         // Non-UTF-8 round-trip
         let orig = vec![vec![vec![0xC0, 0xE9], vec![0xFF, 0xFE]]];
