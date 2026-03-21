@@ -9,7 +9,7 @@ use crate::{escape, unescape};
 pub fn escape_seqseq(seqseq: &[Vec<String>]) -> Vec<Vec<String>> {
     seqseq
         .iter()
-        .map(|row| row.iter().map(|cell| escape(cell)).collect())
+        .map(|row| row.iter().map(|cell| escape(cell).into_owned()).collect())
         .collect()
 }
 
@@ -17,7 +17,7 @@ pub fn escape_seqseq(seqseq: &[Vec<String>]) -> Vec<Vec<String>> {
 pub fn unescape_seqseq(seqseq: &[Vec<String>]) -> Vec<Vec<String>> {
     seqseq
         .iter()
-        .map(|row| row.iter().map(|cell| unescape(cell)).collect())
+        .map(|row| row.iter().map(|cell| unescape(cell).into_owned()).collect())
         .collect()
 }
 
