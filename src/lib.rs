@@ -518,17 +518,8 @@ impl<R: io::Read> Reader<R> {
                 Ok(_) if byte[0] != b'\n' => self.line_buf.push(byte[0]),
                 Ok(_) if self.line_buf.is_empty() => return Ok(Some(std::mem::take(&mut self.row))),
                 Ok(_) => {
-                    match unescape_bytes(&self.line_buf) {
-                        Cow::Borrowed(_) => {
-                            // No unescaping needed — take the buffer directly,
-                            // avoiding a copy. line_buf becomes a fresh Vec.
-                            self.row.push(std::mem::take(&mut self.line_buf));
-                        }
-                        Cow::Owned(v) => {
-                            self.row.push(v);
-                            self.line_buf.clear();
-                        }
-                    }
+                    self.row.push(unescape_bytes(&self.line_buf).into_owned());
+                    self.line_buf.clear();
                 }
             }
         }
