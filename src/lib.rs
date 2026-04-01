@@ -1,6 +1,6 @@
 //! NSV (Newline-Separated Values) format implementation for Rust
 //!
-//! Fast parallel implementation using rayon and memchr.
+//! Fast implementation using memchr, with optional parallel parsing via rayon.
 //! See https://nsv-format.org for the specification.
 //!
 //! ## Parallel Parsing Strategy
@@ -19,6 +19,7 @@
 pub mod util;
 
 use memchr::memmem;
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 use std::borrow::Cow;
@@ -56,12 +57,12 @@ pub fn decode_bytes<'a>(input: &'a [u8]) -> Vec<Vec<Cow<'a, [u8]>>> {
         return Vec::new();
     }
 
-    // For small inputs, use sequential fast path
-    if input.len() < PARALLEL_THRESHOLD {
-        return decode_bytes_sequential(input);
+    #[cfg(feature = "parallel")]
+    if input.len() >= PARALLEL_THRESHOLD {
+        return decode_bytes_parallel(input);
     }
 
-    decode_bytes_parallel(input)
+    decode_bytes_sequential(input)
 }
 
 /// Sequential implementation for small inputs (byte-level).
@@ -98,6 +99,7 @@ fn decode_bytes_sequential<'a>(input: &'a [u8]) -> Vec<Vec<Cow<'a, [u8]>>> {
 /// Splits the input into N equal-sized byte chunks (one per core), aligns each
 /// split point to the nearest `\n\n` row boundary, and parses each chunk
 /// independently. The sequential phase is O(N), not O(input_len).
+#[cfg(feature = "parallel")]
 fn decode_bytes_parallel<'a>(input: &'a [u8]) -> Vec<Vec<Cow<'a, [u8]>>> {
     let num_threads = rayon::current_num_threads();
     let chunk_size = input.len() / num_threads;
@@ -272,11 +274,12 @@ pub fn decode_bytes_projected<'a>(input: &'a [u8], columns: &[usize]) -> Vec<Vec
         return Vec::new();
     }
 
-    if input.len() < PARALLEL_THRESHOLD {
-        decode_projected_sequential(input, columns)
-    } else {
-        decode_projected_parallel(input, columns)
+    #[cfg(feature = "parallel")]
+    if input.len() >= PARALLEL_THRESHOLD {
+        return decode_projected_parallel(input, columns);
     }
+
+    decode_projected_sequential(input, columns)
 }
 
 /// Sequential single-pass projected decode.
@@ -332,6 +335,7 @@ fn decode_projected_sequential<'a>(input: &'a [u8], columns: &[usize]) -> Vec<Ve
 }
 
 /// Parallel single-pass projected decode.
+#[cfg(feature = "parallel")]
 fn decode_projected_parallel<'a>(input: &'a [u8], columns: &[usize]) -> Vec<Vec<Cow<'a, [u8]>>> {
     let num_threads = rayon::current_num_threads();
     let chunk_size = input.len() / num_threads;

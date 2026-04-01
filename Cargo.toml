@@ -10,8 +10,12 @@ keywords = ["nsv", "data", "format", "parser"]
 categories = ["parsing", "data-structures"]
 authors = ["naming"]
 
+[features]
+default = ["parallel"]
+parallel = ["rayon"]
+
 [dependencies]
-rayon = "1.10"
+rayon = { version = "1.10", optional = true }
 memchr = "2.7"
 
 [dev-dependencies]
