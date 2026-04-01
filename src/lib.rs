@@ -18,7 +18,6 @@
 
 pub mod util;
 
-#[allow(unused_imports)]
 use memchr::memmem;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -29,7 +28,6 @@ use std::io::{self, Read, Write};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Threshold for using parallel parsing (64KB)
-#[allow(dead_code)]
 const PARALLEL_THRESHOLD: usize = 64 * 1024;
 
 /// Decode an NSV string into a seqseq.
