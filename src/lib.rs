@@ -18,7 +18,7 @@
 
 pub mod util;
 
-#[cfg(feature = "parallel")]
+#[allow(unused_imports)]
 use memchr::memmem;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
