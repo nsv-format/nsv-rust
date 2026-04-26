@@ -251,19 +251,21 @@ pub fn escape_bytes(s: &[u8]) -> Cow<'_, [u8]> {
 // columns entirely (no allocation, no unescape), and directly produces
 // the final `Vec<Vec<Vec<u8>>>`.
 
-/// Column type for projected decoding.
+/// Column kind for projected decoding.
 ///
-/// Gates per-column unescape: [`ColumnType::String`] cells go through
-/// the unescape pass; [`ColumnType::Raw`] cells are returned verbatim
-/// as borrowed slices of the input — zero copy.
+/// Used to gate per-column unescape: only [`ColumnType::String`] cells
+/// need to interpret `\n` and `\\`. [`ColumnType::Raw`] is the catch-all
+/// for non-string columns under a schema (numeric, temporal, …) whose
+/// accepted spellings cannot contain `\n` or `\\` and so are returned
+/// raw — zero copy.
 ///
 /// More variants may be added as the projected-decode API grows; for
 /// now their only effect is on unescape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ColumnType {
-    /// Cells are unescaped — `\n` and `\\` interpreted as their target bytes.
+    /// NSV string column — cells go through the unescape pass.
     String,
-    /// Cells are returned raw, escape sequences and all.
+    /// Non-string column — cells are returned raw, escape sequences and all.
     Raw,
 }
 
@@ -1097,7 +1099,7 @@ mod tests {
 
     /// Test helper: project column `c` as a String column (i.e. unescape).
     fn s(c: usize) -> (usize, ColumnType) { (c, ColumnType::String) }
-    /// Test helper: project column `c` as Raw (no unescape).
+    /// Test helper: project column `c` as Raw (i.e. raw, no unescape).
     fn o(c: usize) -> (usize, ColumnType) { (c, ColumnType::Raw) }
 
     #[test]
@@ -1171,7 +1173,7 @@ mod tests {
         assert_eq!(projected_all, full);
     }
 
-    // ── ColumnType::Raw tests ──
+    // ── ColumnType::Raw (skip-unescape) tests ──
 
     #[test]
     fn test_raw_returns_raw_bytes() {
@@ -1188,10 +1190,10 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_independent_of_projection_order() {
-        // c0 has an escape, c1 doesn't. Project in REVERSE order with
-        // c0 as Raw. The escape should survive regardless of where c0
-        // lands in the projection.
+    fn test_raw_kind_independent_of_projection_order() {
+        // c0 has an escape, c1 doesn't. Project in REVERSE order ([1, 0])
+        // and project c0 as Raw (raw). The escape in c0 should survive
+        // regardless of where it lands in the projection order.
         let nsv = b"c0\nc1\n\nA\\nB\n42\n\n";
         let projected = decode_bytes_projected(nsv, &[s(1), o(0)]);
         assert_eq!(projected[1][0].as_ref(), b"42");        // c1 in slot 0, unescaped
