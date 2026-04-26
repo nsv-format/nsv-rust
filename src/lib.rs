@@ -251,21 +251,10 @@ pub fn escape_bytes(s: &[u8]) -> Cow<'_, [u8]> {
 // columns entirely (no allocation, no unescape), and directly produces
 // the final `Vec<Vec<Vec<u8>>>`.
 
-/// Column type for projected decoding.
-///
-/// Used to gate per-column unescape: only [`ColumnType::String`] cells
-/// need to interpret `\n` and `\\`. [`ColumnType::Raw`] is the catch-all
-/// for non-string columns under a schema (numeric, temporal, …) whose
-/// accepted spellings cannot contain `\n` or `\\` and so are returned
-/// raw — zero copy.
-///
-/// More variants may be added as the projected-decode API grows; for
-/// now their only effect is on unescape.
+/// Column types currently recognized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ColumnType {
-    /// NSV string column — cells go through the unescape pass.
     String,
-    /// Non-string column — cells are returned raw, escape sequences and all.
     Raw,
 }
 
