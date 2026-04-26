@@ -251,22 +251,20 @@ pub fn escape_bytes(s: &[u8]) -> Cow<'_, [u8]> {
 // columns entirely (no allocation, no unescape), and directly produces
 // the final `Vec<Vec<Vec<u8>>>`.
 
-/// Column kind for projected decoding.
+/// Column type for projected decoding.
 ///
-/// Used to gate per-column unescape: only [`ColumnType::String`] cells
-/// need to interpret `\n` and `\\`. [`ColumnType::Other`] is the catch-all
-/// for non-string columns under a schema (numeric, temporal, …) whose
-/// accepted spellings cannot contain `\n` or `\\` and so are returned
-/// raw — zero copy.
+/// Gates per-column unescape: [`ColumnType::String`] cells go through
+/// the unescape pass; [`ColumnType::Raw`] cells are returned verbatim
+/// as borrowed slices of the input — zero copy.
 ///
 /// More variants may be added as the projected-decode API grows; for
 /// now their only effect is on unescape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ColumnType {
-    /// NSV string column — cells go through the unescape pass.
+    /// Cells are unescaped — `\n` and `\\` interpreted as their target bytes.
     String,
-    /// Non-string column — cells are returned raw, escape sequences and all.
-    Other,
+    /// Cells are returned raw, escape sequences and all.
+    Raw,
 }
 
 /// Per-column projection: `(original_col, kind, unescape)` — built once
@@ -288,7 +286,7 @@ fn build_projection(
 ///
 /// Each entry of `columns` pairs an original-column index with its
 /// [`ColumnType`]. Only [`ColumnType::String`] cells are unescaped;
-/// [`ColumnType::Other`] cells are returned as borrowed slices of `input`
+/// [`ColumnType::Raw`] cells are returned as borrowed slices of `input`
 /// — zero copy, zero allocation.
 ///
 /// Single-pass: scans for cell/row boundaries and writes directly into
@@ -296,7 +294,7 @@ fn build_projection(
 /// entries (same order as `columns`).
 ///
 /// Cells are returned as `Cow<[u8]>` — borrowed when no unescaping was
-/// needed (always, for `Other`; opportunistically, for `String` cells
+/// needed (always, for `Raw`; opportunistically, for `String` cells
 /// without escape sequences).
 pub fn decode_bytes_projected<'a>(
     input: &'a [u8],
@@ -1099,8 +1097,8 @@ mod tests {
 
     /// Test helper: project column `c` as a String column (i.e. unescape).
     fn s(c: usize) -> (usize, ColumnType) { (c, ColumnType::String) }
-    /// Test helper: project column `c` as Other (i.e. raw, no unescape).
-    fn o(c: usize) -> (usize, ColumnType) { (c, ColumnType::Other) }
+    /// Test helper: project column `c` as Raw (no unescape).
+    fn o(c: usize) -> (usize, ColumnType) { (c, ColumnType::Raw) }
 
     #[test]
     fn test_project_subset() {
@@ -1173,12 +1171,12 @@ mod tests {
         assert_eq!(projected_all, full);
     }
 
-    // ── ColumnType::Other (skip-unescape) tests ──
+    // ── ColumnType::Raw tests ──
 
     #[test]
-    fn test_other_returns_raw_bytes() {
+    fn test_raw_returns_raw_bytes() {
         // Cell contains an escape sequence \\n (encoded as backslash-n).
-        // Other returns raw bytes; String unescapes.
+        // Raw returns raw bytes; String unescapes.
         let nsv = b"col\n\nLine 1\\nLine 2\n\n";
 
         let raw = decode_bytes_projected(nsv, &[o(0)]);
@@ -1190,10 +1188,10 @@ mod tests {
     }
 
     #[test]
-    fn test_other_kind_independent_of_projection_order() {
+    fn test_raw_independent_of_projection_order() {
         // c0 has an escape, c1 doesn't. Project in REVERSE order with
-        // c0 as Other (raw). The escape should survive regardless of
-        // where c0 lands in the projection.
+        // c0 as Raw. The escape should survive regardless of where c0
+        // lands in the projection.
         let nsv = b"c0\nc1\n\nA\\nB\n42\n\n";
         let projected = decode_bytes_projected(nsv, &[s(1), o(0)]);
         assert_eq!(projected[1][0].as_ref(), b"42");        // c1 in slot 0, unescaped
@@ -1211,7 +1209,7 @@ mod tests {
     }
 
     #[test]
-    fn test_other_parallel() {
+    fn test_raw_parallel() {
         // Force the parallel path with > PARALLEL_THRESHOLD bytes.
         let mut data = Vec::new();
         for i in 0..10_000 {
