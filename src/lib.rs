@@ -16,6 +16,7 @@
 //!
 //! For smaller files, we use a sequential fast path to avoid thread overhead.
 
+pub mod types;
 pub mod util;
 
 use memchr::memmem;
