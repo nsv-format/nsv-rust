@@ -1,41 +1,44 @@
-//! Type narrowing and per-cell parsing for NSV columns.
+//! Per-cell parsing and column type inference for NSV.
 //!
-//! NSV cells are bytes; this module gives consumers (DuckDB extension, ENSV,
-//! Python bindings, …) a shared, DuckDB-agnostic way to:
+//! Surface:
 //!
 //! - parse a single cell into a typed value ([`Type::try_cast`]),
 //! - validate a cell against a declared type ([`Type::accepts`]),
 //! - infer a column type from a sample of cells ([`infer_column`]).
 //!
-//! Empty cells encode NULL in NSV, so the typed parsers reject `""`. The
-//! inference pass skips empty cells: an all-NULL column resolves to
+//! Empty cells encode NULL in NSV; the typed parsers reject `""`, the
+//! inference pass skips empty cells, and an all-NULL column resolves to
 //! [`Type::Varchar`].
 //!
-//! ## Cast semantics
+//! Consumers that need their own conversion semantics (e.g. a DuckDB
+//! extension applying DuckDB's BOOL spellings, a pandas reader applying
+//! pandas' `na_values`) should bypass this module and parse cells
+//! themselves. This module commits to one specific set of accepted
+//! spellings; widening it to be everyone's-conversion-rules is not the
+//! goal.
 //!
-//! - **BigInt**: parsed as `i64` via [`str::parse`]; rejects leading `+`,
-//!   whitespace, locale separators, scientific notation, and overflow.
-//! - **Double**: parsed as `f64` via [`str::parse`]; accepts `inf`/`nan`
-//!   spellings that Rust's float parser accepts.
-//! - **Date / Timestamp**: strict RFC 3339 (`full-date` and `date-time`).
-//!   No locale alternates, no missing offset, no space-separator leniency
-//!   beyond the one RFC 3339 §5.6 NOTE explicitly permits.
+//! ## Accepted spellings
 //!
-//! These are *not* the same as DuckDB's casters. The `nsv-duckdb` extension
-//! currently delegates to DuckDB's built-in casts; rewiring it onto this
-//! module would tighten DATE/TIMESTAMP parsing in particular. That rewire
-//! is out of scope here.
+//! - **BigInt**: signed decimal integer fitting in `i64`. No leading `+`,
+//!   no whitespace, no separators, no scientific notation.
+//! - **Double**: decimal or scientific notation parseable as `f64`,
+//!   including `inf`/`nan` spellings Rust's float parser accepts.
+//! - **Date**: `YYYY-MM-DD` (RFC 3339 `full-date`), validated against
+//!   the proleptic Gregorian calendar.
+//! - **Timestamp**: `YYYY-MM-DD(T| )HH:MM:SS[.fraction](Z|±HH:MM)`
+//!   (RFC 3339 `date-time`). Offset is required.
 //!
 //! ## Stability
 //!
-//! New module in a 0.0.x crate. Surface may change before 1.0.
+//! New module in a 0.0.x crate. The set of types and the accepted
+//! spellings are not yet settled — both may change before 1.0.
 
 // ── Type enum ────────────────────────────────────────────────────────
 
 /// Column type produced by inference, or accepted by per-cell casts.
 ///
-/// Variants are listed in the order used by [`DEFAULT_LADDER`]: most
-/// specific first, [`Type::Varchar`] last as the always-accepting fallback.
+/// Variants are listed in the order [`DEFAULT_INFERENCE_ORDER`] tries
+/// them. [`Type::Varchar`] always accepts and so sits last.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Type {
     BigInt,
@@ -286,8 +289,9 @@ fn is_leap_year(year: i32) -> bool {
 
 // ── Inference ────────────────────────────────────────────────────────
 
-/// Default inference ladder: most specific first, [`Type::Varchar`] last.
-pub const DEFAULT_LADDER: &[Type] = &[
+/// Order in which [`infer_column`] tries candidate types. The first
+/// candidate that accepts every non-empty cell wins.
+pub const DEFAULT_INFERENCE_ORDER: &[Type] = &[
     Type::BigInt,
     Type::Double,
     Type::Date,
@@ -298,25 +302,25 @@ pub const DEFAULT_LADDER: &[Type] = &[
 /// Recommended sample size for column inference.
 pub const DEFAULT_SAMPLE_SIZE: usize = 1000;
 
-/// Infer a column type from a sample of cells using [`DEFAULT_LADDER`].
+/// Infer a column type from a sample of cells using [`DEFAULT_INFERENCE_ORDER`].
 ///
 /// Empty cells are treated as NULL and skipped. An all-NULL sample
-/// resolves to [`Type::Varchar`] (matching the `nsv-duckdb` convention).
-/// Callers should pre-truncate to [`DEFAULT_SAMPLE_SIZE`] cells.
+/// resolves to [`Type::Varchar`]. Callers should pre-truncate to
+/// [`DEFAULT_SAMPLE_SIZE`] cells.
 pub fn infer_column<I, S>(cells: I) -> Type
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    infer_column_with(cells, DEFAULT_LADDER)
+    infer_column_with(cells, DEFAULT_INFERENCE_ORDER)
 }
 
-/// Infer a column type using a caller-supplied ladder.
+/// Infer a column type using a caller-supplied candidate order.
 ///
 /// The first candidate that accepts every non-empty cell wins; if no
-/// candidate accepts every cell, returns [`Type::Varchar`]. If `ladder`
+/// candidate accepts every cell, returns [`Type::Varchar`]. If `order`
 /// is empty, returns [`Type::Varchar`].
-pub fn infer_column_with<I, S>(cells: I, ladder: &[Type]) -> Type
+pub fn infer_column_with<I, S>(cells: I, order: &[Type]) -> Type
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
@@ -333,7 +337,7 @@ where
         return Type::Varchar;
     }
 
-    for &candidate in ladder {
+    for &candidate in order {
         if candidate == Type::Varchar {
             return Type::Varchar;
         }
@@ -455,7 +459,7 @@ mod tests {
     #[test]
     fn accepts_matches_try_cast() {
         for s in ["true", "42", "3.14", "2024-01-01", "2024-01-01T00:00:00Z", "x", ""] {
-            for t in DEFAULT_LADDER {
+            for t in DEFAULT_INFERENCE_ORDER {
                 assert_eq!(t.accepts(s), t.try_cast(s).is_some(), "{:?} on {:?}", t, s);
             }
         }
@@ -490,10 +494,10 @@ mod tests {
     }
 
     #[test]
-    fn infer_with_custom_ladder() {
+    fn infer_with_custom_order() {
         // Skip BigInt: "42" should fall through to Double.
-        let ladder = &[Type::Double, Type::Varchar];
-        assert_eq!(infer_column_with(["42"], ladder), Type::Double);
+        let order = &[Type::Double, Type::Varchar];
+        assert_eq!(infer_column_with(["42"], order), Type::Double);
         assert_eq!(infer_column_with(["42"], &[]), Type::Varchar);
     }
 }
