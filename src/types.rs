@@ -13,7 +13,6 @@
 //!
 //! ## Cast semantics
 //!
-//! - **Boolean**: exactly `true` or `false`, lowercase ASCII.
 //! - **BigInt**: parsed as `i64` via [`str::parse`]; rejects leading `+`,
 //!   whitespace, locale separators, scientific notation, and overflow.
 //! - **Double**: parsed as `f64` via [`str::parse`]; accepts `inf`/`nan`
@@ -39,7 +38,6 @@
 /// specific first, [`Type::Varchar`] last as the always-accepting fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Type {
-    Boolean,
     BigInt,
     Double,
     Date,
@@ -56,7 +54,6 @@ impl Type {
             return None;
         }
         match self {
-            Type::Boolean => try_parse_boolean(s).map(Value::Boolean),
             Type::BigInt => try_parse_bigint(s).map(Value::BigInt),
             Type::Double => try_parse_double(s).map(Value::Double),
             Type::Date => try_parse_date(s).map(Value::Date),
@@ -76,7 +73,6 @@ impl Type {
 /// Result of [`Type::try_cast`]. `Varchar` borrows from the input.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value<'a> {
-    Boolean(bool),
     BigInt(i64),
     Double(f64),
     Date(Date),
@@ -113,15 +109,6 @@ pub struct Timestamp {
 }
 
 // ── Per-type parsers ─────────────────────────────────────────────────
-
-/// Parse exactly `true` or `false` (lowercase).
-pub fn try_parse_boolean(s: &str) -> Option<bool> {
-    match s {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    }
-}
 
 /// Parse as `i64` via [`str::parse`].
 pub fn try_parse_bigint(s: &str) -> Option<i64> {
@@ -300,11 +287,7 @@ fn is_leap_year(year: i32) -> bool {
 // ── Inference ────────────────────────────────────────────────────────
 
 /// Default inference ladder: most specific first, [`Type::Varchar`] last.
-///
-/// Mirrors the candidate set used by the `nsv-duckdb` extension today
-/// (`BOOLEAN, BIGINT, DOUBLE, DATE, TIMESTAMP, VARCHAR`).
 pub const DEFAULT_LADDER: &[Type] = &[
-    Type::Boolean,
     Type::BigInt,
     Type::Double,
     Type::Date,
@@ -366,18 +349,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Boolean
-    #[test]
-    fn boolean_accepts_canonical_only() {
-        assert_eq!(try_parse_boolean("true"), Some(true));
-        assert_eq!(try_parse_boolean("false"), Some(false));
-        assert_eq!(try_parse_boolean("True"), None);
-        assert_eq!(try_parse_boolean("TRUE"), None);
-        assert_eq!(try_parse_boolean("1"), None);
-        assert_eq!(try_parse_boolean(""), None);
-        assert_eq!(try_parse_boolean(" true"), None);
-    }
 
     // BigInt
     #[test]
@@ -474,11 +445,10 @@ mod tests {
     // try_cast / accepts
     #[test]
     fn try_cast_dispatches_per_type() {
-        assert!(matches!(Type::Boolean.try_cast("true"), Some(Value::Boolean(true))));
         assert!(matches!(Type::BigInt.try_cast("42"), Some(Value::BigInt(42))));
         assert!(matches!(Type::Double.try_cast("2.5"), Some(Value::Double(_))));
         assert!(matches!(Type::Varchar.try_cast("anything"), Some(Value::Varchar("anything"))));
-        assert!(Type::Boolean.try_cast("").is_none());
+        assert!(Type::BigInt.try_cast("").is_none());
         assert!(Type::Varchar.try_cast("").is_none());
     }
 
@@ -494,7 +464,6 @@ mod tests {
     // Inference
     #[test]
     fn infer_picks_most_specific() {
-        assert_eq!(infer_column(["true", "false", "true"]), Type::Boolean);
         assert_eq!(infer_column(["1", "2", "3"]), Type::BigInt);
         assert_eq!(infer_column(["1", "2.0", "3"]), Type::Double);
         assert_eq!(infer_column(["2024-01-01", "2024-12-31"]), Type::Date);
@@ -502,6 +471,7 @@ mod tests {
             infer_column(["2024-01-01T00:00:00Z", "2024-12-31T23:59:59Z"]),
             Type::Timestamp
         );
+        assert_eq!(infer_column(["true", "false"]), Type::Varchar);
         assert_eq!(infer_column(["a", "b"]), Type::Varchar);
     }
 
@@ -516,25 +486,14 @@ mod tests {
     #[test]
     fn infer_falls_through_on_mixed() {
         assert_eq!(infer_column(["1", "abc"]), Type::Varchar);
-        assert_eq!(infer_column(["true", "1"]), Type::Varchar);
+        assert_eq!(infer_column(["1.0", "abc"]), Type::Varchar);
     }
 
     #[test]
     fn infer_with_custom_ladder() {
         // Skip BigInt: "42" should fall through to Double.
-        let ladder = &[Type::Boolean, Type::Double, Type::Varchar];
+        let ladder = &[Type::Double, Type::Varchar];
         assert_eq!(infer_column_with(["42"], ladder), Type::Double);
         assert_eq!(infer_column_with(["42"], &[]), Type::Varchar);
-    }
-
-    /// Mirrors the four-column fixture in `nsv-duckdb`'s test suite:
-    /// `('Alice', '30', '50000.50', 'true'), ('Bob', '25', '75000.25', 'false')`
-    /// → `(VARCHAR, BIGINT, DOUBLE, BOOLEAN)`.
-    #[test]
-    fn infer_matches_nsv_duckdb_fixture() {
-        assert_eq!(infer_column(["Alice", "Bob"]), Type::Varchar);
-        assert_eq!(infer_column(["30", "25"]), Type::BigInt);
-        assert_eq!(infer_column(["50000.50", "75000.25"]), Type::Double);
-        assert_eq!(infer_column(["true", "false"]), Type::Boolean);
     }
 }
