@@ -251,7 +251,7 @@ pub fn escape_bytes(s: &[u8]) -> Cow<'_, [u8]> {
 // columns entirely (no allocation, no unescape), and directly produces
 // the final `Vec<Vec<Vec<u8>>>`.
 
-/// Column kind for projected decoding.
+/// Column type for projected decoding.
 ///
 /// Used to gate per-column unescape: only [`ColumnType::String`] cells
 /// need to interpret `\n` and `\\`. [`ColumnType::Raw`] is the catch-all
@@ -278,9 +278,9 @@ fn build_projection(
     let max_col = columns.iter().map(|&(c, _)| c).max().unwrap_or(0);
     let mut col_map = vec![usize::MAX; max_col + 1];
     let mut unescape_map = vec![false; max_col + 1];
-    for (proj_idx, &(orig_col, kind)) in columns.iter().enumerate() {
+    for (proj_idx, &(orig_col, ty)) in columns.iter().enumerate() {
         col_map[orig_col] = proj_idx;
-        unescape_map[orig_col] = matches!(kind, ColumnType::String);
+        unescape_map[orig_col] = matches!(ty, ColumnType::String);
     }
     (col_map, unescape_map, max_col)
 }
@@ -1187,7 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_kind_independent_of_projection_order() {
+    fn test_raw_independent_of_projection_order() {
         // c0 has an escape, c1 doesn't. Project in REVERSE order ([1, 0])
         // and project c0 as Raw (raw). The escape in c0 should survive
         // regardless of where it lands in the projection order.
@@ -1198,7 +1198,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mixed_kinds() {
+    fn test_mixed_types() {
         // c0 needs unescape (has \\n), c1 is plain numeric, c2 has \\\\.
         let nsv = b"c0\nc1\nc2\n\nA\\nB\n42\n\\\\\n\n";
         let projected = decode_bytes_projected(nsv, &[s(0), o(1), o(2)]);
