@@ -1,5 +1,9 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use nsv::{encode, decode, decode_bytes, decode_bytes_projected};
+use nsv::{encode, decode, decode_bytes, decode_bytes_projected, ColumnType};
+
+fn ss(cols: &[usize]) -> Vec<(usize, ColumnType)> {
+    cols.iter().map(|&c| (c, ColumnType::String)).collect()
+}
 
 fn generate_test_data(rows: usize, cells_per_row: usize) -> Vec<Vec<String>> {
     (0..rows)
@@ -84,19 +88,19 @@ fn bench_projection_10k(c: &mut Criterion) {
     });
 
     group.bench_function("projected_1_of_10", |b| {
-        b.iter(|| decode_bytes_projected(black_box(nsv_bytes), &[0]))
+        b.iter(|| decode_bytes_projected(black_box(nsv_bytes), &ss(&[0])))
     });
 
     group.bench_function("projected_2_of_10", |b| {
-        b.iter(|| decode_bytes_projected(black_box(nsv_bytes), &[0, 5]))
+        b.iter(|| decode_bytes_projected(black_box(nsv_bytes), &ss(&[0, 5])))
     });
 
     group.bench_function("projected_5_of_10", |b| {
-        b.iter(|| decode_bytes_projected(black_box(nsv_bytes), &[0, 2, 4, 6, 8]))
+        b.iter(|| decode_bytes_projected(black_box(nsv_bytes), &ss(&[0, 2, 4, 6, 8])))
     });
 
     group.bench_function("projected_all_10", |b| {
-        b.iter(|| decode_bytes_projected(black_box(nsv_bytes), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]))
+        b.iter(|| decode_bytes_projected(black_box(nsv_bytes), &ss(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])))
     });
 
     group.finish();
@@ -114,11 +118,11 @@ fn bench_projection_100k(c: &mut Criterion) {
     });
 
     group.bench_function("projected_1_of_10", |b| {
-        b.iter(|| decode_bytes_projected(black_box(nsv_bytes), &[0]))
+        b.iter(|| decode_bytes_projected(black_box(nsv_bytes), &ss(&[0])))
     });
 
     group.bench_function("projected_2_of_10", |b| {
-        b.iter(|| decode_bytes_projected(black_box(nsv_bytes), &[0, 5]))
+        b.iter(|| decode_bytes_projected(black_box(nsv_bytes), &ss(&[0, 5])))
     });
 
     group.finish();
@@ -137,15 +141,15 @@ fn bench_projection_wide(c: &mut Criterion) {
     });
 
     group.bench_function("projected_1_of_100", |b| {
-        b.iter(|| decode_bytes_projected(black_box(nsv_bytes), &[50]))
+        b.iter(|| decode_bytes_projected(black_box(nsv_bytes), &ss(&[50])))
     });
 
     group.bench_function("projected_5_of_100", |b| {
-        b.iter(|| decode_bytes_projected(black_box(nsv_bytes), &[0, 25, 50, 75, 99]))
+        b.iter(|| decode_bytes_projected(black_box(nsv_bytes), &ss(&[0, 25, 50, 75, 99])))
     });
 
     group.bench_function("projected_10_of_100", |b| {
-        b.iter(|| decode_bytes_projected(black_box(nsv_bytes), &[0, 10, 20, 30, 40, 50, 60, 70, 80, 90]))
+        b.iter(|| decode_bytes_projected(black_box(nsv_bytes), &ss(&[0, 10, 20, 30, 40, 50, 60, 70, 80, 90])))
     });
 
     group.finish();
