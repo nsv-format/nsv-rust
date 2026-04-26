@@ -16,7 +16,6 @@
 //!
 //! For smaller files, we use a sequential fast path to avoid thread overhead.
 
-pub mod types;
 pub mod util;
 
 use memchr::memmem;
@@ -271,20 +270,52 @@ fn build_col_map(columns: &[usize]) -> (Vec<usize>, usize) {
 ///
 /// Cells are returned as `Cow<[u8]>` — borrowed when no unescaping was needed.
 pub fn decode_bytes_projected<'a>(input: &'a [u8], columns: &[usize]) -> Vec<Vec<Cow<'a, [u8]>>> {
+    decode_bytes_projected_with_unescape(input, columns, &vec![true; columns.len()])
+}
+
+/// Like [`decode_bytes_projected`], but takes a per-projected-column flag
+/// indicating whether to unescape that column. Columns where
+/// `unescape[i] == false` are returned as borrowed slices of `input`,
+/// bypassing the unescape pass entirely.
+///
+/// Skipping unescape is sound for any column whose accepted spellings
+/// cannot contain `\n` or `\\` — e.g. numeric or temporal columns under
+/// a schema that restricts them to a non-escaping subset of ASCII.
+/// The caller is responsible for matching the flag to the column's
+/// declared type; cells in a `false` column are returned verbatim and
+/// will retain any escape sequences they contain.
+///
+/// # Panics
+///
+/// Panics if `unescape.len() != columns.len()`.
+pub fn decode_bytes_projected_with_unescape<'a>(
+    input: &'a [u8],
+    columns: &[usize],
+    unescape: &[bool],
+) -> Vec<Vec<Cow<'a, [u8]>>> {
+    assert_eq!(
+        unescape.len(),
+        columns.len(),
+        "unescape flags must match projected columns"
+    );
     if input.is_empty() || columns.is_empty() {
         return Vec::new();
     }
 
     #[cfg(feature = "parallel")]
     if input.len() >= PARALLEL_THRESHOLD {
-        return decode_projected_parallel(input, columns);
+        return decode_projected_parallel(input, columns, unescape);
     }
 
-    decode_projected_sequential(input, columns)
+    decode_projected_sequential(input, columns, unescape)
 }
 
 /// Sequential single-pass projected decode.
-fn decode_projected_sequential<'a>(input: &'a [u8], columns: &[usize]) -> Vec<Vec<Cow<'a, [u8]>>> {
+fn decode_projected_sequential<'a>(
+    input: &'a [u8],
+    columns: &[usize],
+    unescape: &[bool],
+) -> Vec<Vec<Cow<'a, [u8]>>> {
     let (col_map, max_col) = build_col_map(columns);
     let stride = columns.len();
     let mut data: Vec<Vec<Cow<'a, [u8]>>> = Vec::new();
@@ -299,7 +330,12 @@ fn decode_projected_sequential<'a>(input: &'a [u8], columns: &[usize]) -> Vec<Ve
                 if col_idx <= max_col {
                     if let Some(&proj_idx) = col_map.get(col_idx) {
                         if proj_idx != usize::MAX {
-                            row[proj_idx] = unescape_bytes(&input[start..pos]);
+                            let raw = &input[start..pos];
+                            row[proj_idx] = if unescape[proj_idx] {
+                                unescape_bytes(raw)
+                            } else {
+                                Cow::Borrowed(raw)
+                            };
                         }
                     }
                 }
@@ -321,7 +357,12 @@ fn decode_projected_sequential<'a>(input: &'a [u8], columns: &[usize]) -> Vec<Ve
         if col_idx <= max_col {
             if let Some(&proj_idx) = col_map.get(col_idx) {
                 if proj_idx != usize::MAX {
-                    row[proj_idx] = unescape_bytes(&input[start..]);
+                    let raw = &input[start..];
+                    row[proj_idx] = if unescape[proj_idx] {
+                        unescape_bytes(raw)
+                    } else {
+                        Cow::Borrowed(raw)
+                    };
                 }
             }
         }
@@ -337,12 +378,16 @@ fn decode_projected_sequential<'a>(input: &'a [u8], columns: &[usize]) -> Vec<Ve
 
 /// Parallel single-pass projected decode.
 #[cfg(feature = "parallel")]
-fn decode_projected_parallel<'a>(input: &'a [u8], columns: &[usize]) -> Vec<Vec<Cow<'a, [u8]>>> {
+fn decode_projected_parallel<'a>(
+    input: &'a [u8],
+    columns: &[usize],
+    unescape: &[bool],
+) -> Vec<Vec<Cow<'a, [u8]>>> {
     let num_threads = rayon::current_num_threads();
     let chunk_size = input.len() / num_threads;
 
     if chunk_size == 0 {
-        return decode_projected_sequential(input, columns);
+        return decode_projected_sequential(input, columns, unescape);
     }
 
     let finder = memmem::Finder::new(b"\n\n");
@@ -362,14 +407,14 @@ fn decode_projected_parallel<'a>(input: &'a [u8], columns: &[usize]) -> Vec<Vec<
     splits.dedup();
 
     if splits.len() <= 2 {
-        return decode_projected_sequential(input, columns);
+        return decode_projected_sequential(input, columns, unescape);
     }
 
     let chunks: Vec<&[u8]> = splits.windows(2).map(|w| &input[w[0]..w[1]]).collect();
 
     let chunk_results: Vec<Vec<Vec<Cow<'a, [u8]>>>> = chunks
         .par_iter()
-        .map(|chunk| decode_projected_sequential(chunk, columns))
+        .map(|chunk| decode_projected_sequential(chunk, columns, unescape))
         .collect();
 
     let total_rows: usize = chunk_results.iter().map(|r| r.len()).sum();
@@ -1119,6 +1164,96 @@ mod tests {
         let full = owned(decode_bytes(encoded_bytes));
         let projected_all = owned(decode_bytes_projected(encoded_bytes, &[0, 1, 2]));
         assert_eq!(projected_all, full);
+    }
+
+    // ── Skip-unescape tests ──
+
+    #[test]
+    fn test_skip_unescape_returns_raw_bytes() {
+        // Cell contains an escape sequence \\n (encoded as backslash-n).
+        // With unescape=false we should get the raw bytes back, including
+        // the backslash. With unescape=true we should get an actual LF.
+        let nsv = b"col\n\nLine 1\\nLine 2\n\n";
+
+        let raw = decode_bytes_projected_with_unescape(nsv, &[0], &[false]);
+        assert_eq!(raw[1][0].as_ref(), b"Line 1\\nLine 2");
+        assert!(matches!(raw[1][0], Cow::Borrowed(_)));
+
+        let unescaped = decode_bytes_projected_with_unescape(nsv, &[0], &[true]);
+        assert_eq!(unescaped[1][0].as_ref(), b"Line 1\nLine 2");
+    }
+
+    #[test]
+    fn test_skip_unescape_no_escapes_zero_copy() {
+        let nsv = b"name\nage\n\nAlice\n30\n\nBob\n25\n\n";
+        let projected = decode_bytes_projected_with_unescape(nsv, &[0, 1], &[true, false]);
+        // The age column (no escapes ever) is borrowed regardless.
+        assert_eq!(projected[1][1].as_ref(), b"30");
+        assert!(matches!(projected[1][1], Cow::Borrowed(_)));
+        // The name column unescapes — also borrowed since "Alice" has no escapes.
+        assert!(matches!(projected[1][0], Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_skip_unescape_mixed_columns() {
+        // c0 needs unescape (has \\n), c1 is plain numeric, c2 has \\\\.
+        let nsv = b"c0\nc1\nc2\n\nA\\nB\n42\n\\\\\n\n";
+        let projected = decode_bytes_projected_with_unescape(
+            nsv,
+            &[0, 1, 2],
+            &[true, false, false],
+        );
+        assert_eq!(projected[1][0].as_ref(), b"A\nB");      // unescaped
+        assert_eq!(projected[1][1].as_ref(), b"42");        // raw, no escapes anyway
+        assert_eq!(projected[1][2].as_ref(), b"\\\\");      // raw, escapes preserved
+    }
+
+    #[test]
+    fn test_skip_unescape_default_matches_all_true() {
+        let nsv = b"a\nb\n\n1\n2\n\n3\n4\n\n";
+        let default = owned(decode_bytes_projected(nsv, &[0, 1]));
+        let explicit = owned(decode_bytes_projected_with_unescape(
+            nsv,
+            &[0, 1],
+            &[true, true],
+        ));
+        assert_eq!(default, explicit);
+    }
+
+    #[test]
+    #[should_panic(expected = "unescape flags must match projected columns")]
+    fn test_skip_unescape_panics_on_length_mismatch() {
+        let nsv = b"a\nb\n\n";
+        let _ = decode_bytes_projected_with_unescape(nsv, &[0, 1], &[true]);
+    }
+
+    #[test]
+    fn test_skip_unescape_parallel() {
+        // Force the parallel path with > PARALLEL_THRESHOLD bytes.
+        let mut data = Vec::new();
+        for i in 0..10_000 {
+            data.push(vec![
+                format!("escaped\\n{}", i),     // typed col would never look like this
+                format!("{}", i),               // numeric, no escapes
+            ]);
+        }
+        // Encode raw — bypass nsv::encode so the literal backslash survives.
+        let mut buf = Vec::new();
+        for row in &data {
+            for cell in row {
+                buf.extend_from_slice(cell.as_bytes());
+                buf.push(b'\n');
+            }
+            buf.push(b'\n');
+        }
+        assert!(buf.len() > PARALLEL_THRESHOLD);
+
+        let projected = decode_bytes_projected_with_unescape(&buf, &[0, 1], &[false, false]);
+        assert_eq!(projected.len(), data.len());
+        for (i, row) in data.iter().enumerate() {
+            assert_eq!(projected[i][0].as_ref(), row[0].as_bytes());
+            assert_eq!(projected[i][1].as_ref(), row[1].as_bytes());
+        }
     }
 
     // ── Streaming tests ──
