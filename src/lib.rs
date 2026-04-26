@@ -269,8 +269,9 @@ pub enum ColumnType {
     Raw,
 }
 
-/// Per-column projection: `(original_col, kind, unescape)` — built once
-/// from a `&[(usize, ColumnType)]` and indexed by original column.
+/// Build a column-map: `col_map[original_col] = projected_index`.
+/// Entries for non-projected columns are `usize::MAX`. Also produces
+/// `unescape_map[original_col] = true` iff the column is a String column.
 fn build_projection(
     columns: &[(usize, ColumnType)],
 ) -> (Vec<usize>, Vec<bool>, usize) {
@@ -287,17 +288,13 @@ fn build_projection(
 /// Decode only the specified columns from raw bytes.
 ///
 /// Each entry of `columns` pairs an original-column index with its
-/// [`ColumnType`]. Only [`ColumnType::String`] cells are unescaped;
-/// [`ColumnType::Raw`] cells are returned as borrowed slices of `input`
-/// — zero copy, zero allocation.
+/// [`ColumnType`]; only [`ColumnType::String`] cells are unescaped.
 ///
-/// Single-pass: scans for cell/row boundaries and writes directly into
-/// the projected output. Each inner vec has exactly `columns.len()`
-/// entries (same order as `columns`).
+/// Single-pass: scans for cell/row boundaries and directly unescapes
+/// only the cells in projected columns.  No intermediate structural index.
+/// Each inner vec has exactly `columns.len()` entries (same order as `columns`).
 ///
-/// Cells are returned as `Cow<[u8]>` — borrowed when no unescaping was
-/// needed (always, for `Raw`; opportunistically, for `String` cells
-/// without escape sequences).
+/// Cells are returned as `Cow<[u8]>` — borrowed when no unescaping was needed.
 pub fn decode_bytes_projected<'a>(
     input: &'a [u8],
     columns: &[(usize, ColumnType)],
