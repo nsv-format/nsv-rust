@@ -253,8 +253,8 @@ pub fn escape_bytes(s: &[u8]) -> Cow<'_, [u8]> {
 
 /// Column kind for projected decoding.
 ///
-/// Used to gate per-column unescape: only [`ColumnKind::String`] cells
-/// need to interpret `\n` and `\\`. [`ColumnKind::Other`] is the catch-all
+/// Used to gate per-column unescape: only [`ColumnType::String`] cells
+/// need to interpret `\n` and `\\`. [`ColumnType::Other`] is the catch-all
 /// for non-string columns under a schema (numeric, temporal, …) whose
 /// accepted spellings cannot contain `\n` or `\\` and so are returned
 /// raw — zero copy.
@@ -262,7 +262,7 @@ pub fn escape_bytes(s: &[u8]) -> Cow<'_, [u8]> {
 /// More variants may be added as the projected-decode API grows; for
 /// now their only effect is on unescape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ColumnKind {
+pub enum ColumnType {
     /// NSV string column — cells go through the unescape pass.
     String,
     /// Non-string column — cells are returned raw, escape sequences and all.
@@ -270,16 +270,16 @@ pub enum ColumnKind {
 }
 
 /// Per-column projection: `(original_col, kind, unescape)` — built once
-/// from a `&[(usize, ColumnKind)]` and indexed by original column.
+/// from a `&[(usize, ColumnType)]` and indexed by original column.
 fn build_projection(
-    columns: &[(usize, ColumnKind)],
+    columns: &[(usize, ColumnType)],
 ) -> (Vec<usize>, Vec<bool>, usize) {
     let max_col = columns.iter().map(|&(c, _)| c).max().unwrap_or(0);
     let mut col_map = vec![usize::MAX; max_col + 1];
     let mut unescape_map = vec![false; max_col + 1];
     for (proj_idx, &(orig_col, kind)) in columns.iter().enumerate() {
         col_map[orig_col] = proj_idx;
-        unescape_map[orig_col] = matches!(kind, ColumnKind::String);
+        unescape_map[orig_col] = matches!(kind, ColumnType::String);
     }
     (col_map, unescape_map, max_col)
 }
@@ -287,8 +287,8 @@ fn build_projection(
 /// Decode only the specified columns from raw bytes.
 ///
 /// Each entry of `columns` pairs an original-column index with its
-/// [`ColumnKind`]. Only [`ColumnKind::String`] cells are unescaped;
-/// [`ColumnKind::Other`] cells are returned as borrowed slices of `input`
+/// [`ColumnType`]. Only [`ColumnType::String`] cells are unescaped;
+/// [`ColumnType::Other`] cells are returned as borrowed slices of `input`
 /// — zero copy, zero allocation.
 ///
 /// Single-pass: scans for cell/row boundaries and writes directly into
@@ -300,7 +300,7 @@ fn build_projection(
 /// without escape sequences).
 pub fn decode_bytes_projected<'a>(
     input: &'a [u8],
-    columns: &[(usize, ColumnKind)],
+    columns: &[(usize, ColumnType)],
 ) -> Vec<Vec<Cow<'a, [u8]>>> {
     if input.is_empty() || columns.is_empty() {
         return Vec::new();
@@ -317,7 +317,7 @@ pub fn decode_bytes_projected<'a>(
 /// Sequential single-pass projected decode.
 fn decode_projected_sequential<'a>(
     input: &'a [u8],
-    columns: &[(usize, ColumnKind)],
+    columns: &[(usize, ColumnType)],
 ) -> Vec<Vec<Cow<'a, [u8]>>> {
     let (col_map, unescape_map, max_col) = build_projection(columns);
     let stride = columns.len();
@@ -383,7 +383,7 @@ fn decode_projected_sequential<'a>(
 #[cfg(feature = "parallel")]
 fn decode_projected_parallel<'a>(
     input: &'a [u8],
-    columns: &[(usize, ColumnKind)],
+    columns: &[(usize, ColumnType)],
 ) -> Vec<Vec<Cow<'a, [u8]>>> {
     let num_threads = rayon::current_num_threads();
     let chunk_size = input.len() / num_threads;
@@ -1098,9 +1098,9 @@ mod tests {
     // ── Projected decode tests ──
 
     /// Test helper: project column `c` as a String column (i.e. unescape).
-    fn s(c: usize) -> (usize, ColumnKind) { (c, ColumnKind::String) }
+    fn s(c: usize) -> (usize, ColumnType) { (c, ColumnType::String) }
     /// Test helper: project column `c` as Other (i.e. raw, no unescape).
-    fn o(c: usize) -> (usize, ColumnKind) { (c, ColumnKind::Other) }
+    fn o(c: usize) -> (usize, ColumnType) { (c, ColumnType::Other) }
 
     #[test]
     fn test_project_subset() {
@@ -1173,7 +1173,7 @@ mod tests {
         assert_eq!(projected_all, full);
     }
 
-    // ── ColumnKind::Other (skip-unescape) tests ──
+    // ── ColumnType::Other (skip-unescape) tests ──
 
     #[test]
     fn test_other_returns_raw_bytes() {

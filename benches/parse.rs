@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use nsv::{encode, decode, decode_bytes, decode_bytes_projected, ColumnKind};
+use nsv::{encode, decode, decode_bytes, decode_bytes_projected, ColumnType};
 
-fn s(c: usize) -> (usize, ColumnKind) { (c, ColumnKind::String) }
+fn s(c: usize) -> (usize, ColumnType) { (c, ColumnType::String) }
 
 fn generate_test_data(rows: usize, cells_per_row: usize) -> Vec<Vec<String>> {
     (0..rows)
