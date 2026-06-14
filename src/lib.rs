@@ -448,12 +448,13 @@ pub fn check(input: &[u8]) -> Vec<Warning> {
         if escaped {
             match b {
                 b'n' | b'\\' => {}
-                b'\n' => warnings.push(Warning {
+                b'\n' if i - 1 != line_start => warnings.push(Warning {
                     kind: WarningKind::DanglingBackslash,
                     pos: i - 1,
                     line,
                     col: i - line_start,
                 }),
+                b'\n' => {}
                 _ => warnings.push(Warning {
                     kind: WarningKind::UnknownEscape(b),
                     pos: i - 1,
@@ -985,6 +986,50 @@ mod tests {
                     col: 6,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn test_check_empty_cell_token_no_warning() {
+        assert_eq!(check(b"\\\n\n"), vec![]);
+    }
+
+    #[test]
+    fn test_check_empty_cell_token_unterminated_row() {
+        let warnings = check(b"\\\n");
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.kind == WarningKind::DanglingBackslash),
+            "empty-cell token must not warn as dangling backslash: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_dangling_backslash_with_content_still_warns() {
+        let warnings = check(b"text\\\n\n");
+        assert_eq!(
+            warnings,
+            vec![Warning {
+                kind: WarningKind::DanglingBackslash,
+                pos: 4,
+                line: 1,
+                col: 5,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_check_empty_cell_and_dangling_mixed() {
+        let warnings = check(b"\\\nabc\\\n\n");
+        assert_eq!(
+            warnings,
+            vec![Warning {
+                kind: WarningKind::DanglingBackslash,
+                pos: 5,
+                line: 2,
+                col: 4,
+            }]
         );
     }
 
