@@ -112,6 +112,32 @@ fn bench_n(n: usize, mut f: impl FnMut()) -> f64 {
 }
 
 fn main() {
+    // If a file path is given, benchmark both strategies on that real fixture.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 {
+        let path = &args[1];
+        let input = std::fs::read(path).expect("read fixture");
+        let kb = input.len() as f64 / 1024.0;
+        let mb = input.len() as f64 / (1024.0 * 1024.0);
+        println!("fixture: {} ({:.1}MB)\n", path, mb);
+
+        // sanity: both must agree
+        let a = decode_byteloop(&input);
+        let b = decode_memchr(&input);
+        assert_eq!(a.len(), b.len(), "row count mismatch");
+        println!("rows: {}", a.len());
+        let total_cells: usize = a.iter().map(|r| r.len()).sum();
+        println!("cells: {} (avg {:.2} bytes/cell across input)\n",
+            total_cells, input.len() as f64 / total_cells.max(1) as f64);
+
+        let iters = 15;
+        let t_loop = bench_n(iters, || { let _ = std::hint::black_box(decode_byteloop(std::hint::black_box(&input))); });
+        let t_mc = bench_n(iters, || { let _ = std::hint::black_box(decode_memchr(std::hint::black_box(&input))); });
+        println!("{:>10}  {:>10}  {:>8}", "byteloop", "memchr", "speedup");
+        println!("{:>9.3}µs/KB  {:>8.3}µs/KB  {:>7.2}x", t_loop / kb, t_mc / kb, t_loop / t_mc);
+        return;
+    }
+
     let size = 1024 * 1024; // 1MB, sequential range
     println!("1MB input, no escapes, varying cell width (µs/KB)\n");
     println!("{:>10}  {:>10}  {:>10}  {:>8}", "cell_width", "byteloop", "memchr", "speedup");
