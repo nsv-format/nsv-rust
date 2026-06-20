@@ -65,22 +65,22 @@ pub fn decode_bytes<'a>(input: &'a [u8]) -> Vec<Vec<Cow<'a, [u8]>>> {
     decode_bytes_sequential(input)
 }
 
-/// Sequential implementation (byte-level). Uses memchr for SIMD-accelerated
-/// newline scanning instead of a byte-by-byte loop.
+/// Sequential implementation (byte-level).
 fn decode_bytes_sequential<'a>(input: &'a [u8]) -> Vec<Vec<Cow<'a, [u8]>>> {
     let mut data = Vec::new();
     let mut row: Vec<Cow<'a, [u8]>> = Vec::new();
     let mut start = 0;
 
-    while let Some(offset) = memchr::memchr(b'\n', &input[start..]) {
-        let pos = start + offset;
-        if pos > start {
-            row.push(unescape_bytes(&input[start..pos]));
-        } else {
-            data.push(row);
-            row = Vec::new();
+    for (pos, &b) in input.iter().enumerate() {
+        if b == b'\n' {
+            if pos > start {
+                row.push(unescape_bytes(&input[start..pos]));
+            } else {
+                data.push(row);
+                row = Vec::new();
+            }
+            start = pos + 1;
         }
-        start = pos + 1;
     }
 
     if start < input.len() {
@@ -292,27 +292,28 @@ fn decode_projected_sequential<'a>(input: &'a [u8], columns: &[usize]) -> Vec<Ve
     let mut start = 0;
     let mut row_has_cells = false;
 
-    while let Some(offset) = memchr::memchr(b'\n', &input[start..]) {
-        let pos = start + offset;
-        if pos > start {
-            if col_idx <= max_col {
-                if let Some(&proj_idx) = col_map.get(col_idx) {
-                    if proj_idx != usize::MAX {
-                        row[proj_idx] = unescape_bytes(&input[start..pos]);
+    for (pos, &b) in input.iter().enumerate() {
+        if b == b'\n' {
+            if pos > start {
+                if col_idx <= max_col {
+                    if let Some(&proj_idx) = col_map.get(col_idx) {
+                        if proj_idx != usize::MAX {
+                            row[proj_idx] = unescape_bytes(&input[start..pos]);
+                        }
                     }
                 }
+                col_idx += 1;
+                row_has_cells = true;
+            } else {
+                if row_has_cells || !data.is_empty() || col_idx == 0 {
+                    data.push(row);
+                    row = vec![Cow::Borrowed(b""); stride];
+                }
+                col_idx = 0;
+                row_has_cells = false;
             }
-            col_idx += 1;
-            row_has_cells = true;
-        } else {
-            if row_has_cells || !data.is_empty() || col_idx == 0 {
-                data.push(row);
-                row = vec![Cow::Borrowed(b""); stride];
-            }
-            col_idx = 0;
-            row_has_cells = false;
+            start = pos + 1;
         }
-        start = pos + 1;
     }
 
     if start < input.len() {
