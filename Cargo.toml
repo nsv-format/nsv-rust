@@ -29,7 +29,3 @@ harness = false
 [[bench]]
 name = "comparison"
 harness = false
-
-[[bench]]
-name = "threshold"
-harness = false
