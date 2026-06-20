@@ -70,29 +70,34 @@ fn main() {
     println!("{:>8}  {:>10}  {:>10}", "size", "decode_bytes", "µs/KB");
     println!("{:>8}  {:>10}  {:>10}", "----", "----------", "-----");
 
-    for &target in &[
-        8 * 1024,
-        16 * 1024,
-        32 * 1024,
-        48 * 1024,
+    let targets: Vec<usize> = vec![
         64 * 1024,
-        96 * 1024,
         128 * 1024,
-        192 * 1024,
         256 * 1024,
-        384 * 1024,
         512 * 1024,
-        768 * 1024,
         1024 * 1024,
         2 * 1024 * 1024,
         4 * 1024 * 1024,
-    ] {
-        let input = make_nsv_near_size(target);
+        8 * 1024 * 1024,
+        16 * 1024 * 1024,
+        32 * 1024 * 1024,
+        64 * 1024 * 1024,
+        128 * 1024 * 1024,
+    ];
+
+    // Pre-generate all inputs so allocation isn't measured
+    let inputs: Vec<Vec<u8>> = targets.iter().map(|&t| make_nsv_near_size(t)).collect();
+
+    for input in &inputs {
         let size = input.len();
-        let t = bench_n(200, || {
-            let _ = std::hint::black_box(nsv::decode_bytes(std::hint::black_box(&input)));
+        let iters = if size > 32 * 1024 * 1024 { 10 } else if size > 4 * 1024 * 1024 { 30 } else { 100 };
+        let t = bench_n(iters, || {
+            let _ = std::hint::black_box(nsv::decode_bytes(std::hint::black_box(input)));
         });
-        let kb = size as f64 / 1024.0;
-        println!("{:>7.0}KB  {:>9.1}µs  {:>9.2}", kb, t, t / kb);
+        if size >= 1024 * 1024 {
+            println!("{:>6.0}MB  {:>11.1}µs  {:>9.2}", size as f64 / (1024.0 * 1024.0), t, t / (size as f64 / 1024.0));
+        } else {
+            println!("{:>5.0}KB  {:>11.1}µs  {:>9.2}", size as f64 / 1024.0, t, t / (size as f64 / 1024.0));
+        }
     }
 }
