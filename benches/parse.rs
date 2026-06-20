@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use nsv::{encode, decode, decode_bytes, decode_bytes_projected};
+use nsv::{encode, decode, decode_bytes, decode_bytes_projected, Reader};
 
 fn generate_test_data(rows: usize, cells_per_row: usize) -> Vec<Vec<String>> {
     (0..rows)
@@ -151,6 +151,38 @@ fn bench_projection_wide(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Reader (streaming) benchmarks ────────────────────────────────────
+
+fn bench_reader_10k(c: &mut Criterion) {
+    let data = generate_test_data(10_000, 10);
+    let nsv = encode(&data);
+    let nsv_bytes = nsv.as_bytes();
+
+    c.bench_function("reader_10k_rows", |b| {
+        b.iter(|| {
+            let mut reader = Reader::new(std::io::Cursor::new(black_box(nsv_bytes)));
+            while let Some(row) = reader.next_row().unwrap() {
+                black_box(row);
+            }
+        })
+    });
+}
+
+fn bench_reader_100k(c: &mut Criterion) {
+    let data = generate_test_data(100_000, 10);
+    let nsv = encode(&data);
+    let nsv_bytes = nsv.as_bytes();
+
+    c.bench_function("reader_100k_rows", |b| {
+        b.iter(|| {
+            let mut reader = Reader::new(std::io::Cursor::new(black_box(nsv_bytes)));
+            while let Some(row) = reader.next_row().unwrap() {
+                black_box(row);
+            }
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_loads_small,
@@ -162,5 +194,7 @@ criterion_group!(
     bench_projection_10k,
     bench_projection_100k,
     bench_projection_wide,
+    bench_reader_10k,
+    bench_reader_100k,
 );
 criterion_main!(benches);

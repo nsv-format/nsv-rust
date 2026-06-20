@@ -27,8 +27,8 @@ use std::io::{self, Read, Write};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Threshold for using parallel parsing (64KB)
-const PARALLEL_THRESHOLD: usize = 64 * 1024;
+/// Threshold for using parallel parsing (bytes)
+const PARALLEL_THRESHOLD: usize = 256 * 1024;
 
 /// Decode an NSV string into a seqseq.
 pub fn decode(s: &str) -> Vec<Vec<String>> {
@@ -65,7 +65,7 @@ pub fn decode_bytes<'a>(input: &'a [u8]) -> Vec<Vec<Cow<'a, [u8]>>> {
     decode_bytes_sequential(input)
 }
 
-/// Sequential implementation for small inputs (byte-level).
+/// Sequential implementation (byte-level).
 fn decode_bytes_sequential<'a>(input: &'a [u8]) -> Vec<Vec<Cow<'a, [u8]>>> {
     let mut data = Vec::new();
     let mut row: Vec<Cow<'a, [u8]>> = Vec::new();
@@ -759,11 +759,9 @@ mod tests {
         // Test parallel path with empty rows mixed in
         let mut data = Vec::new();
 
-        // Create enough data to exceed 64KB threshold
-        for i in 0..10_000 {
+        for i in 0..40_000 {
             data.push(vec![format!("value{}", i)]);
 
-            // Add empty row every 100 rows
             if i % 100 == 0 {
                 data.push(vec![]);
             }
@@ -781,7 +779,7 @@ mod tests {
         // Test parallel path with cells containing escape sequences
         let mut data = Vec::new();
 
-        for i in 0..10_000 {
+        for i in 0..20_000 {
             data.push(vec![
                 format!("Line 1\nLine 2 {}", i),
                 format!("Backslash: \\ {}", i),
