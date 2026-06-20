@@ -27,7 +27,7 @@ use std::io::{self, Read, Write};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Threshold for using parallel parsing (64KB)
+/// Threshold for using parallel parsing (bytes)
 const PARALLEL_THRESHOLD: usize = 256 * 1024;
 
 /// Decode an NSV string into a seqseq.
