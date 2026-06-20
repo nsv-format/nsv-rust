@@ -28,7 +28,7 @@ use std::io::{self, Read, Write};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Threshold for using parallel parsing (64KB)
-const PARALLEL_THRESHOLD: usize = 64 * 1024;
+const PARALLEL_THRESHOLD: usize = 256 * 1024;
 
 /// Decode an NSV string into a seqseq.
 pub fn decode(s: &str) -> Vec<Vec<String>> {
@@ -65,22 +65,22 @@ pub fn decode_bytes<'a>(input: &'a [u8]) -> Vec<Vec<Cow<'a, [u8]>>> {
     decode_bytes_sequential(input)
 }
 
-/// Sequential implementation for small inputs (byte-level).
+/// Sequential implementation (byte-level). Uses memchr for SIMD-accelerated
+/// newline scanning instead of a byte-by-byte loop.
 fn decode_bytes_sequential<'a>(input: &'a [u8]) -> Vec<Vec<Cow<'a, [u8]>>> {
     let mut data = Vec::new();
     let mut row: Vec<Cow<'a, [u8]>> = Vec::new();
     let mut start = 0;
 
-    for (pos, &b) in input.iter().enumerate() {
-        if b == b'\n' {
-            if pos > start {
-                row.push(unescape_bytes(&input[start..pos]));
-            } else {
-                data.push(row);
-                row = Vec::new();
-            }
-            start = pos + 1;
+    while let Some(offset) = memchr::memchr(b'\n', &input[start..]) {
+        let pos = start + offset;
+        if pos > start {
+            row.push(unescape_bytes(&input[start..pos]));
+        } else {
+            data.push(row);
+            row = Vec::new();
         }
+        start = pos + 1;
     }
 
     if start < input.len() {
@@ -292,28 +292,27 @@ fn decode_projected_sequential<'a>(input: &'a [u8], columns: &[usize]) -> Vec<Ve
     let mut start = 0;
     let mut row_has_cells = false;
 
-    for (pos, &b) in input.iter().enumerate() {
-        if b == b'\n' {
-            if pos > start {
-                if col_idx <= max_col {
-                    if let Some(&proj_idx) = col_map.get(col_idx) {
-                        if proj_idx != usize::MAX {
-                            row[proj_idx] = unescape_bytes(&input[start..pos]);
-                        }
+    while let Some(offset) = memchr::memchr(b'\n', &input[start..]) {
+        let pos = start + offset;
+        if pos > start {
+            if col_idx <= max_col {
+                if let Some(&proj_idx) = col_map.get(col_idx) {
+                    if proj_idx != usize::MAX {
+                        row[proj_idx] = unescape_bytes(&input[start..pos]);
                     }
                 }
-                col_idx += 1;
-                row_has_cells = true;
-            } else {
-                if row_has_cells || !data.is_empty() || col_idx == 0 {
-                    data.push(row);
-                    row = vec![Cow::Borrowed(b""); stride];
-                }
-                col_idx = 0;
-                row_has_cells = false;
             }
-            start = pos + 1;
+            col_idx += 1;
+            row_has_cells = true;
+        } else {
+            if row_has_cells || !data.is_empty() || col_idx == 0 {
+                data.push(row);
+                row = vec![Cow::Borrowed(b""); stride];
+            }
+            col_idx = 0;
+            row_has_cells = false;
         }
+        start = pos + 1;
     }
 
     if start < input.len() {
@@ -759,11 +758,9 @@ mod tests {
         // Test parallel path with empty rows mixed in
         let mut data = Vec::new();
 
-        // Create enough data to exceed 64KB threshold
-        for i in 0..10_000 {
+        for i in 0..40_000 {
             data.push(vec![format!("value{}", i)]);
 
-            // Add empty row every 100 rows
             if i % 100 == 0 {
                 data.push(vec![]);
             }
@@ -781,7 +778,7 @@ mod tests {
         // Test parallel path with cells containing escape sequences
         let mut data = Vec::new();
 
-        for i in 0..10_000 {
+        for i in 0..20_000 {
             data.push(vec![
                 format!("Line 1\nLine 2 {}", i),
                 format!("Backslash: \\ {}", i),
